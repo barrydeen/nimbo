@@ -28,6 +28,7 @@ captures/
 
 # Internal release/QA notes
 /GATES.md
+/.unlazy/
 
 # Editors and OS files
 .vscode/
