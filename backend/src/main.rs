@@ -258,13 +258,9 @@ async fn main() -> anyhow::Result<()> {
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal());
-    match tokio::time::timeout(SHUTDOWN_GRACE, server).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            pool.close().await;
-            return Err(err.into());
-        }
-        Err(_) => tracing::warn!("graceful shutdown exceeded its drain budget; exiting"),
+    if let Err(err) = server.await {
+        pool.close().await;
+        return Err(err.into());
     }
     pool.close().await;
     Ok(())
@@ -296,6 +292,14 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     tracing::info!("shutdown signal received; draining requests");
+
+    // Bound the drain from the moment the signal arrives. This timer must not
+    // wrap the whole server future, or the process exits while still serving.
+    tokio::spawn(async {
+        tokio::time::sleep(SHUTDOWN_GRACE).await;
+        tracing::warn!("graceful shutdown exceeded its drain budget; exiting");
+        std::process::exit(0);
+    });
 }
 
 #[cfg(test)]
