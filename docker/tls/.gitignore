@@ -1,0 +1,4 @@
+# Operator-supplied TLS material for docker-compose.production.yml.
+# Certificates and private keys must never be committed.
+*
+!.gitignore

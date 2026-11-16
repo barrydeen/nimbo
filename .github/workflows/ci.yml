@@ -13,26 +13,32 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   backend:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
       - name: Format check
         run: cargo fmt --manifest-path backend/Cargo.toml -- --check
       - name: Clippy
-        run: cargo clippy --manifest-path backend/Cargo.toml -- -D warnings
+        run: cargo clippy --manifest-path backend/Cargo.toml --locked --all-targets -- -D warnings
       - name: Tests
-        run: cargo test --manifest-path backend/Cargo.toml
+        run: cargo test --manifest-path backend/Cargo.toml --locked
 
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
           cache: npm
@@ -46,3 +52,165 @@ jobs:
       - name: Build
         run: npm run build
         working-directory: frontend
+      - name: Sanitizer controls
+        run: node scripts/check-sanitizer.mjs
+        working-directory: frontend
+
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+      - name: Audit production npm dependencies
+        run: npm audit --omit=dev --audit-level=high
+        working-directory: frontend
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit Rust dependencies
+        run: cargo audit --file backend/Cargo.lock
+
+  security-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - name: Build release binary
+        run: cargo build --manifest-path backend/Cargo.toml --release --locked
+      - name: Run integrated security regressions
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/opencode
+          python3 scripts/verify-security-regressions.py --binary backend/target/release/nimbo
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Validate Compose files
+        run: |
+          set -euo pipefail
+          docker compose -f docker/docker-compose.yml config --quiet
+          NIMBO_IMAGE=nimbo:local \
+          NIMBO_DOMAIN=example.com \
+          NIMBO_SETUP_TOKEN="$(openssl rand -hex 16)" \
+            docker compose -f docker/docker-compose.production.yml config --quiet
+
+      - name: Run operational static checks
+        run: python3 scripts/verify-operations.py
+
+      - name: Build backend test target in the container graph
+        run: docker build -f docker/Dockerfile --target backend-test -t nimbo:ci-test .
+
+      - name: Build runtime image
+        run: |
+          docker build \
+            -f docker/Dockerfile \
+            --build-arg VERSION=ci \
+            --build-arg REVISION="$GITHUB_SHA" \
+            -t nimbo:ci .
+
+      - name: Start disposable container and verify persistence
+        env:
+          NIMBO_CI_PORT: "18080"
+        run: |
+          set -euo pipefail
+          volume="nimbo-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cookie="$RUNNER_TEMP/nimbo-ci-cookies.txt"
+          token="$(openssl rand -hex 32)"
+
+          cleanup() {
+            docker rm -f nimbo-ci >/dev/null 2>&1 || true
+            docker volume rm "$volume" >/dev/null 2>&1 || true
+            rm -f "$cookie"
+          }
+          trap cleanup EXIT
+
+          wait_for_health() {
+            for _ in $(seq 1 60); do
+              if curl -fsS "http://127.0.0.1:${NIMBO_CI_PORT}/healthz" >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 1
+            done
+            docker logs nimbo-ci || true
+            return 1
+          }
+
+          docker volume create "$volume"
+          docker run -d --name nimbo-ci \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --security-opt no-new-privileges:true \
+            --cap-drop ALL \
+            --pids-limit 256 \
+            --memory 1g \
+            --cpus 1 \
+            -p "127.0.0.1:${NIMBO_CI_PORT}:8080" \
+            -e NIMBO_SETUP_TOKEN="$token" \
+            -e NIMBO_SECURE_COOKIES=false \
+            -v "$volume:/data" \
+            nimbo:ci
+
+          wait_for_health
+          curl -fsS "http://127.0.0.1:${NIMBO_CI_PORT}/healthz"
+
+          # The configured bootstrap token must be mandatory.
+          status="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'Content-Type: application/json' \
+            -d '{"instance_name":"CI","username":"admin","password":"ci-password-123"}' \
+            "http://127.0.0.1:${NIMBO_CI_PORT}/api/setup")"
+          case "$status" in
+            400|401|403) ;;
+            *) echo "setup without token returned HTTP $status" >&2; exit 1 ;;
+          esac
+
+          curl -fsS -c "$cookie" \
+            -H 'Content-Type: application/json' \
+            -d "{\"instance_name\":\"CI\",\"username\":\"admin\",\"password\":\"ci-password-123\",\"setup_token\":\"$token\"}" \
+            "http://127.0.0.1:${NIMBO_CI_PORT}/api/setup" >/dev/null
+
+          curl -fsS -b "$cookie" \
+            -H 'Content-Type: application/json' \
+            -d '{"path":"ci/smoke.md","content":"persisted across restart"}' \
+            "http://127.0.0.1:${NIMBO_CI_PORT}/api/docs/content" >/dev/null
+
+          docker rm -f nimbo-ci >/dev/null
+          docker run -d --name nimbo-ci \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --security-opt no-new-privileges:true \
+            --cap-drop ALL \
+            --pids-limit 256 \
+            --memory 1g \
+            --cpus 1 \
+            -p "127.0.0.1:${NIMBO_CI_PORT}:8080" \
+            -e NIMBO_SETUP_TOKEN="$token" \
+            -e NIMBO_SECURE_COOKIES=false \
+            -v "$volume:/data" \
+            nimbo:ci
+
+          wait_for_health
+          body="$(curl -fsS -b "$cookie" \
+            "http://127.0.0.1:${NIMBO_CI_PORT}/api/docs/content?path=ci/smoke.md")"
+          case "$body" in
+            *"persisted across restart"*) ;;
+            *) echo "note did not persist across container recreation: $body" >&2; exit 1 ;;
+          esac
+
+          echo "docker persistence smoke test passed"

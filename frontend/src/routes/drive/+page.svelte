@@ -1,12 +1,15 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import { goto, replaceState } from '$app/navigation';
 	import {
 		api,
+		errorMessage,
+		isUnauthorized,
+		uploadFile,
+		UploadError,
 		fileContentUrl,
 		fileDownloadUrl,
 		fileThumbUrl,
-		uploadFiles,
 		type Breadcrumb,
 		type FileDetails,
 		type FileNode,
@@ -14,10 +17,23 @@
 		type ShareLink,
 		type User
 	} from '$lib/api';
+	import { RequestScope, isAbortError } from '$lib/generations';
+	import {
+		PREVIEW_MAX_BYTES,
+		PREVIEW_PREFIX_BYTES,
+		readTextPrefix,
+		truncateCodePoints,
+		type PreviewState
+	} from '$lib/preview';
+	import { sanitizeSnippet } from '$lib/sanitize';
 
 	let user: User | null = null;
 	let instanceName = 'Nimbo';
 	let booted = false;
+	let bootError = '';
+	let booting = false;
+	let disposed = false;
+	let loggingOut = false;
 
 	let view: 'drive' | 'recent' | 'shares' = 'drive';
 	let folderId: string | null = null;
@@ -30,7 +46,7 @@
 	let selected: FileDetails | null = null;
 	let selectedId: string | null = null;
 	let previewText = '';
-	let previewLoading = false;
+	let previewState: PreviewState = 'idle';
 
 	let loading = false;
 	let errorMsg = '';
@@ -54,6 +70,16 @@
 	let uploadLabel = '';
 	let dragActive = false;
 	let origin = '';
+	let uploadMaxBytes: number | null = null;
+	let uploadAbort: AbortController | null = null;
+	let uploadRows: {
+		id: number;
+		name: string;
+		status: 'pending' | 'uploaded' | 'failed' | 'unknown' | 'cancelled';
+		error?: string;
+	}[] = [];
+	let uploadRowSeq = 0;
+	let uploadReconcile = false;
 
 	let shareOpen = false;
 	let shareTarget: FileNode | null = null;
@@ -62,36 +88,91 @@
 	let shareExisting: ShareLink[] = [];
 	let shareBusy = false;
 	let shareError = '';
+	let shareTrigger: HTMLElement | null = null;
+	let dialogEl: HTMLDivElement | undefined;
+
+	let renderLimit = 200;
+	const RENDER_BATCH = 200;
+	let nextOffset: number | null = null;
+	let loadingMore = false;
+	let loadMoreError = '';
+
+	const navScope = new RequestScope();
+	const pageScope = new RequestScope();
+	const detailsScope = new RequestScope();
+	const previewScope = new RequestScope();
+	const searchScope = new RequestScope();
+	const shareScope = new RequestScope();
+	const statsScope = new RequestScope();
 
 	$: metaRows = selected ? metadataRows(selected.item.metadata) : [];
+	$: shownItems = items.slice(0, renderLimit);
+	$: shownRecent = recent.slice(0, renderLimit);
+	$: shownShares = shares.slice(0, renderLimit);
+	$: shownSearchResults = searchResults.slice(0, renderLimit);
 
 	onMount(() => {
-		(async () => {
-			try {
-				const boot = await api.bootstrap();
-				if (!boot.setup_complete) {
-					goto('/setup');
-					return;
-				}
-				if (!boot.user) {
-					goto('/login');
-					return;
-				}
-				user = boot.user;
-				instanceName = boot.instance_name;
-				booted = true;
-				origin = location.origin;
-				const requested = new URLSearchParams(location.search).get('folder');
-				await loadFolder(requested || null);
-				await loadStats();
-			} catch {
-				goto('/login');
-			}
-		})();
+		disposed = false;
+		void initDrive();
+		return () => {
+			disposed = true;
+			navScope.invalidate();
+			pageScope.invalidate();
+			detailsScope.invalidate();
+			previewScope.invalidate();
+			searchScope.invalidate();
+			shareScope.invalidate();
+			statsScope.invalidate();
+			uploadAbort?.abort();
+			if (searchTimer) clearTimeout(searchTimer);
+			if (statusTimer) clearTimeout(statusTimer);
+		};
 	});
 
 	function message(err: unknown): string {
-		return err instanceof Error ? err.message : 'Something went wrong';
+		return errorMessage(err);
+	}
+
+	async function initDrive() {
+		booting = true;
+		bootError = '';
+		errorMsg = '';
+		try {
+			const boot = await api.bootstrap();
+			if (disposed) return;
+			if (!boot.setup_complete) {
+				await goto('/setup');
+				return;
+			}
+			if (!boot.user) {
+				await goto('/login');
+				return;
+			}
+			user = boot.user;
+			instanceName = boot.instance_name;
+			origin = location.origin;
+			booted = true;
+			try {
+				const info = await api.instance();
+				if (typeof info.max_upload_bytes === 'number' && info.max_upload_bytes > 0) {
+					uploadMaxBytes = info.max_upload_bytes;
+				}
+			} catch {
+				// The server limit is still enforced per file; batching stays safe.
+			}
+			const requested = new URLSearchParams(location.search).get('folder');
+			await loadFolder(requested || null);
+			await loadStats();
+		} catch (err) {
+			if (disposed) return;
+			if (isUnauthorized(err)) {
+				await goto('/login');
+				return;
+			}
+			bootError = message(err);
+		} finally {
+			if (!disposed) booting = false;
+		}
 	}
 
 	function flash(text: string) {
@@ -100,15 +181,63 @@
 		statusTimer = setTimeout(() => (statusMsg = ''), 2200);
 	}
 
+	function unauthorized(err: unknown): boolean {
+		if (!isUnauthorized(err)) return false;
+		void goto('/login');
+		return true;
+	}
+
 	async function loadStats() {
+		const op = statsScope.begin();
 		try {
-			stats = await api.filesStats();
-		} catch {
+			const result = await api.filesStats(op.signal);
+			if (statsScope.isCurrent(op.id)) stats = result;
+		} catch (err) {
+			if (isAbortError(err) || !statsScope.isCurrent(op.id)) return;
+			if (isUnauthorized(err)) {
+				void goto('/login');
+				return;
+			}
 			stats = null;
 		}
 	}
 
+	function resetRenderLimit() {
+		renderLimit = RENDER_BATCH;
+	}
+
+	async function showMoreItems() {
+		if (renderLimit < items.length) {
+			renderLimit = Math.min(items.length, renderLimit + RENDER_BATCH);
+			return;
+		}
+		if (nextOffset === null || loadingMore) return;
+		const expectedFolder = folderId;
+		const offset = nextOffset;
+		const op = pageScope.begin();
+		loadingMore = true;
+		loadMoreError = '';
+		try {
+			const listing = await api.listFiles(expectedFolder, op.signal, offset, 500);
+			if (!pageScope.isCurrent(op.id) || folderId !== expectedFolder) return;
+			const known = new Set(items.map((item) => item.id));
+			items = [...items, ...listing.items.filter((item) => !known.has(item.id))];
+			nextOffset = listing.next_offset ?? null;
+			renderLimit = Math.min(items.length, renderLimit + RENDER_BATCH);
+		} catch (err) {
+			if (isAbortError(err) || !pageScope.isCurrent(op.id)) return;
+			if (isUnauthorized(err)) {
+				void goto('/login');
+				return;
+			}
+			loadMoreError = message(err);
+		} finally {
+			if (pageScope.isCurrent(op.id)) loadingMore = false;
+		}
+	}
+
 	async function loadFolder(id: string | null) {
+		const op = navScope.begin();
 		loading = true;
 		errorMsg = '';
 		searchMode = false;
@@ -116,54 +245,85 @@
 		selected = null;
 		selectedId = null;
 		previewText = '';
+		previewState = 'idle';
+		detailsScope.invalidate();
+		previewScope.invalidate();
+		shareScope.invalidate();
+		pageScope.invalidate();
+		resetRenderLimit();
+		nextOffset = null;
+		loadMoreError = '';
 		try {
-			const listing = await api.listFiles(id);
+			const listing = await api.listFiles(id, op.signal);
+			if (!navScope.isCurrent(op.id)) return;
 			folderId = listing.folder.id === 'root' ? null : listing.folder.id;
 			breadcrumbs = listing.breadcrumbs;
 			items = listing.items;
+			nextOffset = listing.next_offset ?? null;
 			replaceState(
 				folderId ? `/drive?folder=${encodeURIComponent(folderId)}` : '/drive',
 				{}
 			);
 		} catch (err) {
+			if (isAbortError(err) || !navScope.isCurrent(op.id)) return;
+			if (unauthorized(err)) return;
 			errorMsg = message(err);
 			if (id) {
-				await loadFolder(null);
+				// Fall back to the root only while this navigation is still current.
+				if (navScope.isCurrent(op.id)) await loadFolder(null);
 			}
 		} finally {
-			loading = false;
+			if (navScope.isCurrent(op.id)) loading = false;
 		}
 	}
 
 	async function loadRecent() {
+		const op = navScope.begin();
 		loading = true;
 		errorMsg = '';
 		selected = null;
 		selectedId = null;
 		previewText = '';
+		previewState = 'idle';
+		detailsScope.invalidate();
+		previewScope.invalidate();
+		shareScope.invalidate();
+		pageScope.invalidate();
 		view = 'recent';
+		resetRenderLimit();
 		try {
-			recent = (await api.recentFiles()).items;
+			recent = (await api.recentFiles(op.signal)).items;
 		} catch (err) {
+			if (isAbortError(err) || !navScope.isCurrent(op.id)) return;
+			if (unauthorized(err)) return;
 			errorMsg = message(err);
 		} finally {
-			loading = false;
+			if (navScope.isCurrent(op.id)) loading = false;
 		}
 	}
 
 	async function loadShares() {
+		const op = navScope.begin();
 		loading = true;
 		errorMsg = '';
 		selected = null;
 		selectedId = null;
 		previewText = '';
+		previewState = 'idle';
+		detailsScope.invalidate();
+		previewScope.invalidate();
+		shareScope.invalidate();
+		pageScope.invalidate();
 		view = 'shares';
+		resetRenderLimit();
 		try {
-			shares = (await api.listShares()).shares;
+			shares = (await api.listShares(op.signal)).shares;
 		} catch (err) {
+			if (isAbortError(err) || !navScope.isCurrent(op.id)) return;
+			if (unauthorized(err)) return;
 			errorMsg = message(err);
 		} finally {
-			loading = false;
+			if (navScope.isCurrent(op.id)) loading = false;
 		}
 	}
 
@@ -180,64 +340,104 @@
 
 	function openItem(item: FileNode) {
 		if (item.kind === 'folder') {
-			loadFolder(item.id);
+			void loadFolder(item.id);
 		} else {
-			selectFile(item.id);
+			void selectFile(item.id);
 		}
 	}
 
 	async function selectFile(id: string) {
+		const op = detailsScope.begin();
+		previewScope.invalidate();
 		selectedId = id;
+		selected = null;
 		previewText = '';
+		previewState = 'idle';
 		try {
-			const details = await api.fileDetails(id);
-			if (selectedId !== id) return;
+			const details = await api.fileDetails(id, op.signal);
+			if (!detailsScope.isCurrent(op.id) || selectedId !== id) return;
 			selected = details;
 			if (isTexty(details.item.mime)) {
-				loadTextPreview(id);
+				void loadTextPreview(details.item);
 			}
 		} catch (err) {
+			if (isAbortError(err) || !detailsScope.isCurrent(op.id) || selectedId !== id) return;
+			if (unauthorized(err)) return;
 			selectedId = null;
+			selected = null;
 			errorMsg = message(err);
 		}
 	}
 
-	async function loadTextPreview(id: string) {
-		previewLoading = true;
+	async function loadTextPreview(item: FileNode) {
+		const op = previewScope.begin();
+		previewText = '';
+		if (item.size > PREVIEW_MAX_BYTES) {
+			previewState = 'too-large';
+			return;
+		}
+		if (item.size === 0) {
+			previewState = 'empty';
+			return;
+		}
+		previewState = 'loading';
 		try {
-			const res = await fetch(fileContentUrl(id), { credentials: 'include' });
-			if (!res.ok) return;
-			const text = await res.text();
-			if (selectedId === id) {
-				previewText =
-					text.length > 120_000 ? `${text.slice(0, 120_000)}\n… (truncated)` : text;
+			const res = await fetch(fileContentUrl(item.id), {
+				credentials: 'include',
+				headers: { Range: `bytes=0-${PREVIEW_PREFIX_BYTES - 1}` },
+				signal: op.signal
+			});
+			if (res.status === 401) {
+				await goto('/login');
+				return;
 			}
-		} catch {
-			/* keep the extracted preview */
-		} finally {
-			previewLoading = false;
+			if (!res.ok) throw new Error(`Preview failed (${res.status})`);
+			const { text, truncated } = await readTextPrefix(res, PREVIEW_PREFIX_BYTES);
+			if (!previewScope.isCurrent(op.id) || selectedId !== item.id) return;
+			const limited = truncateCodePoints(text, 120_000);
+			previewText = limited.truncated || truncated ? `${limited.text}\n… (truncated)` : text;
+			previewState = previewText ? 'loaded' : 'empty';
+		} catch (err) {
+			if (isAbortError(err) || !previewScope.isCurrent(op.id)) return;
+			if (unauthorized(err)) return;
+			previewState = 'error';
 		}
 	}
 
 	function closeDetails() {
+		detailsScope.invalidate();
+		previewScope.invalidate();
 		selected = null;
 		selectedId = null;
 		previewText = '';
+		previewState = 'idle';
 	}
+
+	$: previewDisplay = (() => {
+		if (previewState === 'loading') return 'Loading…';
+		if (previewState === 'loaded') return previewText || 'Empty file.';
+		if (previewState === 'too-large')
+			return 'Preview unavailable: this file is larger than 2 MB. Download it to view the contents.';
+		if (previewState === 'error') return 'Preview unavailable. Download the file to view it.';
+		if (previewState === 'empty') return 'Empty file.';
+		return selected?.item.text_preview || 'No text preview.';
+	})();
 
 	async function createFolder() {
 		const name = newFolderName.trim();
 		if (!name || creatingFolder) return;
 		creatingFolder = true;
+		const parent = folderId;
 		errorMsg = '';
 		try {
-			await api.createFolder({ parent_id: folderId, name });
+			await api.createFolder({ parent_id: parent, name });
 			newFolderName = '';
 			showNewFolder = false;
-			await loadFolder(folderId);
+			if (view === 'drive' && folderId === parent) await loadFolder(parent);
 			await loadStats();
 			flash('Folder created');
 		} catch (err) {
+			if (unauthorized(err)) return;
 			errorMsg = message(err);
 		} finally {
 			creatingFolder = false;
@@ -253,6 +453,7 @@
 			if (selectedId === item.id) await selectFile(item.id);
 			flash('Renamed');
 		} catch (err) {
+			if (unauthorized(err)) return;
 			errorMsg = message(err);
 		}
 	}
@@ -268,6 +469,7 @@
 			await loadStats();
 			flash('Deleted');
 		} catch (err) {
+			if (unauthorized(err)) return;
 			errorMsg = message(err);
 		}
 	}
@@ -280,38 +482,130 @@
 		const input = event.currentTarget as HTMLInputElement;
 		const files = Array.from(input.files ?? []);
 		input.value = '';
-		if (files.length) doUpload(files);
+		if (files.length) void doUpload(files);
+	}
+
+	function cancelUpload() {
+		uploadAbort?.abort();
+	}
+
+	function setUploadRow(
+		id: number,
+		patch: Partial<(typeof uploadRows)[number]>
+	) {
+		uploadRows = uploadRows.map((row) => (row.id === id ? { ...row, ...patch } : row));
+	}
+
+	function cancelPendingRows() {
+		uploadRows = uploadRows.map((row) =>
+			row.status === 'pending' ? { ...row, status: 'cancelled' } : row
+		);
 	}
 
 	async function doUpload(files: File[]) {
 		if (!files.length || uploading) return;
+		const abort = new AbortController();
+		uploadAbort = abort;
 		uploading = true;
 		uploadPercent = 0;
-		uploadLabel =
-			files.length === 1 ? files[0].name : `${files.length} files`;
+		uploadReconcile = false;
+		uploadRows = files.map((file) => ({
+			id: ++uploadRowSeq,
+			name: file.name,
+			status: 'pending' as const
+		}));
 		errorMsg = '';
+		let failedCount = 0;
 		try {
-			const result = await uploadFiles(folderId, files, (percent) => {
-				uploadPercent = percent;
-			});
-			if (result.failed?.length) {
-				errorMsg = result.failed.map((f) => `${f.name}: ${f.error}`).join(' · ');
+			for (let index = 0; index < files.length; index += 1) {
+				if (abort.signal.aborted) {
+					cancelPendingRows();
+					break;
+				}
+				const file = files[index];
+				const row = uploadRows[index];
+				uploadLabel =
+					files.length === 1 ? file.name : `${file.name} (${index + 1}/${files.length})`;
+				if (uploadMaxBytes !== null && file.size > uploadMaxBytes) {
+					setUploadRow(row.id, {
+						status: 'failed',
+						error: `Exceeds the ${formatBytes(uploadMaxBytes)} per-file upload limit.`
+					});
+					failedCount += 1;
+					continue;
+				}
+				try {
+					const result = await uploadFile(folderId, file, {
+						signal: abort.signal,
+						onProgress: (percent) => {
+							uploadPercent = Math.round(((index + percent / 100) / files.length) * 100);
+						}
+					});
+					const failure = result.failed?.[0];
+					if (failure) {
+						setUploadRow(row.id, { status: 'failed', error: failure.error });
+						failedCount += 1;
+					} else if ((result.uploaded?.length ?? 0) > 0) {
+						setUploadRow(row.id, { status: 'uploaded' });
+					} else {
+						setUploadRow(row.id, {
+							status: 'unknown',
+							error: 'The server did not confirm the upload. Refresh before retrying.'
+						});
+						uploadReconcile = true;
+					}
+				} catch (err) {
+					if (isAbortError(err)) {
+						setUploadRow(row.id, { status: 'cancelled' });
+						cancelPendingRows();
+						break;
+					}
+					const ambiguous = err instanceof UploadError && err.ambiguous;
+					setUploadRow(row.id, {
+						status: ambiguous ? 'unknown' : 'failed',
+						error: message(err)
+					});
+					if (ambiguous) uploadReconcile = true;
+					else failedCount += 1;
+				}
+				uploadPercent = Math.round(((index + 1) / files.length) * 100);
 			}
-			const count = result.uploaded?.length ?? 0;
-			if (count) flash(`Uploaded ${count} ${count === 1 ? 'file' : 'files'}`);
-			if (view !== 'drive') {
-				await loadFolder(folderId);
-			} else {
-				await loadFolder(folderId);
-			}
-			await loadStats();
-		} catch (err) {
-			errorMsg = message(err);
 		} finally {
 			uploading = false;
 			uploadPercent = 0;
 			uploadLabel = '';
+			if (uploadAbort === abort) uploadAbort = null;
+			if (abort.signal.aborted) cancelPendingRows();
+			// Reconcile after success, cancellation or an ambiguous failure. Files
+			// that committed before a dropped response must appear in the listing.
+			const uploaded = uploadRows.filter((row) => row.status === 'uploaded').length;
+			if (!disposed && !loggingOut && (uploaded > 0 || uploadReconcile || abort.signal.aborted)) {
+				if (view === 'drive') {
+					await loadFolder(folderId);
+				}
+				await loadStats();
+			}
+			const unknown = uploadRows.filter((row) => row.status === 'unknown').length;
+			const cancelled = uploadRows.filter((row) => row.status === 'cancelled').length;
+			if (uploaded > 0) {
+				const parts = [`Uploaded ${uploaded} ${uploaded === 1 ? 'file' : 'files'}`];
+				if (failedCount) parts.push(`${failedCount} failed`);
+				if (unknown) parts.push(`${unknown} unconfirmed`);
+				if (cancelled) parts.push(`${cancelled} cancelled`);
+				flash(parts.join(' · '));
+			} else if (failedCount) {
+				errorMsg = `${failedCount} ${failedCount === 1 ? 'file' : 'files'} failed. See the upload results below.`;
+			} else if (unknown) {
+				errorMsg =
+					'The server did not confirm the upload. Refresh the folder before retrying to avoid duplicates.';
+			}
 		}
+	}
+
+	function dismissUploadResults() {
+		if (uploading) return;
+		uploadRows = [];
+		errorMsg = '';
 	}
 
 	function onDragOver(event: DragEvent) {
@@ -332,7 +626,7 @@
 		event.preventDefault();
 		dragActive = false;
 		const files = Array.from(event.dataTransfer?.files ?? []);
-		if (files.length) doUpload(files);
+		if (files.length) void doUpload(files);
 	}
 
 	function runSearch() {
@@ -341,19 +635,23 @@
 			clearSearch();
 			return;
 		}
+		const op = searchScope.begin();
 		searching = true;
 		searchMode = true;
+		resetRenderLimit();
 		errorMsg = '';
 		api
-			.searchFiles(q)
+			.searchFiles(q, op.signal)
 			.then((res) => {
-				searchResults = res.results;
+				if (searchScope.isCurrent(op.id)) searchResults = res.results;
 			})
 			.catch((err) => {
+				if (isAbortError(err) || !searchScope.isCurrent(op.id)) return;
+				if (unauthorized(err)) return;
 				errorMsg = message(err);
 			})
 			.finally(() => {
-				searching = false;
+				if (searchScope.isCurrent(op.id)) searching = false;
 			});
 	}
 
@@ -369,24 +667,85 @@
 		searchQuery = '';
 		searchResults = [];
 		searchMode = false;
+		searching = false;
+		searchScope.invalidate();
 	}
 
-	function openShare(item: FileNode) {
+	function snippetHtml(snippet: string): string {
+		return sanitizeSnippet(snippet);
+	}
+
+	function openShare(item: FileNode, event?: MouseEvent) {
+		const trigger = (event?.currentTarget as HTMLElement | null) ?? null;
+		shareTrigger = trigger ?? (document.activeElement as HTMLElement | null);
+		const op = shareScope.begin();
 		shareTarget = item;
 		shareCreated = null;
 		shareExisting = [];
 		shareExpiry = 'never';
 		shareError = '';
 		shareOpen = true;
+		void tick().then(() => dialogEl?.focus());
 		api
-			.listShares()
+			.listShares(op.signal)
 			.then((res) => {
+				if (
+					!shareScope.isCurrent(op.id) ||
+					!shareOpen ||
+					shareTarget?.id !== item.id
+				)
+					return;
 				shares = res.shares;
 				shareExisting = res.shares.filter((share) => share.target_id === item.id);
 			})
-			.catch(() => {
-				shareExisting = [];
+			.catch((err) => {
+				if (isAbortError(err) || !shareScope.isCurrent(op.id)) return;
+				if (unauthorized(err)) return;
+				if (shareOpen && shareTarget?.id === item.id) shareError = message(err);
 			});
+	}
+
+	function closeShare() {
+		if (!shareOpen) return;
+		shareOpen = false;
+		shareScope.invalidate();
+		shareTarget = null;
+		shareCreated = null;
+		shareExisting = [];
+		shareError = '';
+		const trigger = shareTrigger;
+		shareTrigger = null;
+		void tick().then(() => trigger?.focus());
+	}
+
+	function onDialogKeydown(event: KeyboardEvent) {
+		if (event.key === 'Escape') {
+			event.preventDefault();
+			event.stopPropagation();
+			closeShare();
+			return;
+		}
+		if (event.key !== 'Tab') return;
+		const nodes = dialogEl?.querySelectorAll<HTMLElement>(
+			'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+		);
+		if (!nodes || nodes.length === 0) {
+			event.preventDefault();
+			dialogEl?.focus();
+			return;
+		}
+		const first = nodes[0];
+		const last = nodes[nodes.length - 1];
+		const active = document.activeElement;
+		if (event.shiftKey) {
+			if (active === first || active === dialogEl) {
+				event.preventDefault();
+				last.focus();
+			}
+		} else if (active === last) {
+			event.preventDefault();
+			first.focus();
+		}
 	}
 
 	function expirySeconds(choice: string): number {
@@ -404,26 +763,36 @@
 		}
 	}
 
+	function isCurrentShareTarget(id: string): boolean {
+		return shareOpen && shareTarget?.id === id;
+	}
+
 	async function createShareLink() {
 		if (!shareTarget || shareBusy) return;
+		const target = shareTarget;
+		const targetId = target.id;
 		shareBusy = true;
 		shareError = '';
 		try {
 			const seconds = expirySeconds(shareExpiry);
 			const res = await api.createShare({
-				target_type: shareTarget.kind === 'folder' ? 'folder' : 'file',
-				target_id: shareTarget.id,
+				target_type: target.kind === 'folder' ? 'folder' : 'file',
+				target_id: target.id,
 				expires_at: seconds ? Math.floor(Date.now() / 1000) + seconds : null
 			});
-			shareCreated = res.share;
-			shareExisting = [res.share, ...shareExisting];
+			if (isCurrentShareTarget(targetId)) {
+				shareCreated = res.share;
+				shareExisting = [res.share, ...shareExisting];
+			}
 			if (selected && selected.item.id === res.share.target_id) {
 				selected = { ...selected, shares: [res.share, ...selected.shares] };
 			}
 			await loadStats();
-			await copyShare(res.share);
+			if (isCurrentShareTarget(targetId)) await copyShare(res.share);
 		} catch (err) {
-			shareError = message(err);
+			if (unauthorized(err)) return;
+			if (isCurrentShareTarget(targetId)) shareError = message(err);
+			else errorMsg = message(err);
 		} finally {
 			shareBusy = false;
 		}
@@ -441,14 +810,21 @@
 
 	async function revokeShare(share: ShareLink) {
 		if (!confirm('Revoke this link? Anyone using it will lose access immediately.')) return;
+		const targetId = share.target_id;
 		try {
 			await api.revokeShare(share.id);
-			shareExisting = shareExisting.map((s) =>
-				s.id === share.id
-					? ({ ...s, status: 'revoked', revoked_at: Math.floor(Date.now() / 1000) } as ShareLink)
-					: s
-			);
-			if (selected) {
+			if (isCurrentShareTarget(targetId)) {
+				shareExisting = shareExisting.map((s) =>
+					s.id === share.id
+						? ({
+								...s,
+								status: 'revoked',
+								revoked_at: Math.floor(Date.now() / 1000)
+							} as ShareLink)
+						: s
+				);
+			}
+			if (selected && selected.item.id === targetId) {
 				selected = {
 					...selected,
 					shares: selected.shares.map((s) =>
@@ -462,14 +838,16 @@
 					)
 				};
 			}
-			if (shareCreated?.id === share.id) {
+			if (isCurrentShareTarget(targetId) && shareCreated?.id === share.id) {
 				shareCreated = { ...shareCreated, status: 'revoked' } as ShareLink;
 			}
 			if (view === 'shares') await loadShares();
 			await loadStats();
 			flash('Link revoked');
 		} catch (err) {
-			shareError = message(err);
+			if (unauthorized(err)) return;
+			if (isCurrentShareTarget(targetId)) shareError = message(err);
+			else errorMsg = message(err);
 		}
 	}
 
@@ -481,6 +859,7 @@
 		if (answer === null) return;
 		const days = Number(answer);
 		if (!Number.isFinite(days) || days < 0) return;
+		const targetId = share.target_id;
 		try {
 			const res = await api.updateShare(
 				share.id,
@@ -489,13 +868,15 @@
 					: { expires_at: Math.floor(Date.now() / 1000) + Math.round(days * 86_400) }
 			);
 			if (view === 'shares') await loadShares();
-			else {
+			else if (isCurrentShareTarget(targetId)) {
 				shareExisting = shareExisting.map((s) => (s.id === share.id ? res.share : s));
 			}
-			if (selected) await selectFile(selected.item.id);
+			if (selected?.item.id === targetId) await selectFile(targetId);
 			flash('Expiry updated');
 		} catch (err) {
-			shareError = message(err);
+			if (unauthorized(err)) return;
+			if (isCurrentShareTarget(targetId)) shareError = message(err);
+			else errorMsg = message(err);
 		}
 	}
 
@@ -504,8 +885,12 @@
 		try {
 			await api.retryVision(selected.item.id);
 			flash('Image description queued');
-			setTimeout(() => selected && selectFile(selected.item.id), 2500);
+			const id = selected.item.id;
+			setTimeout(() => {
+				if (!disposed && selectedId === id) void selectFile(id);
+			}, 2500);
 		} catch (err) {
+			if (unauthorized(err)) return;
 			errorMsg = message(err);
 		}
 	}
@@ -515,26 +900,33 @@
 		try {
 			await api.reindexFile(selected.item.id);
 			flash('Reindexing queued');
-			setTimeout(() => selected && selectFile(selected.item.id), 2500);
+			const id = selected.item.id;
+			setTimeout(() => {
+				if (!disposed && selectedId === id) void selectFile(id);
+			}, 2500);
 		} catch (err) {
+			if (unauthorized(err)) return;
 			errorMsg = message(err);
 		}
 	}
 
 	function handleKeydown(event: KeyboardEvent) {
-		if (event.key !== 'Escape') return;
-		if (shareOpen) {
-			shareOpen = false;
-		} else if (selected) {
-			closeDetails();
-		}
+		if (event.key !== 'Escape' || shareOpen) return;
+		if (selected) closeDetails();
 	}
 
 	async function logout() {
+		if (loggingOut) return;
+		loggingOut = true;
+		errorMsg = '';
+		uploadAbort?.abort();
 		try {
 			await api.logout();
+			await goto('/login');
+		} catch (err) {
+			errorMsg = `Sign out failed: ${message(err)}. You are still signed in on this device; retry when the server is reachable.`;
 		} finally {
-			goto('/login');
+			loggingOut = false;
 		}
 	}
 
@@ -654,7 +1046,7 @@
 
 <svelte:window on:keydown={handleKeydown} />
 
-<div class="shell drive-shell" class:with-details={!!selected}>
+<div class="shell drive-shell" class:with-details={!!selected} inert={shareOpen}>
 	<header class="topbar">
 		<div class="brand">
 			<span class="mark">N</span>
@@ -675,7 +1067,9 @@
 		{#if user?.role === 'admin'}
 			<button class="btn ghost" on:click={() => goto('/settings')}>Settings</button>
 		{/if}
-		<button class="btn ghost" on:click={logout}>Sign out</button>
+		<button class="btn ghost" on:click={logout} disabled={loggingOut}>
+			{loggingOut ? 'Signing out…' : 'Sign out'}
+		</button>
 	</header>
 
 	<aside class="sidebar">
@@ -832,12 +1226,52 @@
 			<button class="btn ghost" title="Refresh" on:click={refreshCurrent}>Refresh</button>
 		</div>
 
-		{#if uploading}
+		{#if bootError}
+			<div class="banner dismissable">
+				<span>{bootError}</span>
+				<button class="btn primary" on:click={initDrive} disabled={booting}>
+					{booting ? 'Retrying…' : 'Retry'}
+				</button>
+			</div>
+		{/if}
+
+		{#if uploading || uploadRows.length}
 			<div class="upload-banner">
 				<div class="upload-copy">
-					<span>Uploading {uploadLabel}</span><span>{uploadPercent}%</span>
+					<span>{uploading ? `Uploading ${uploadLabel}` : 'Upload results'}</span>
+					<span>{uploading ? `${uploadPercent}%` : ''}</span>
 				</div>
-				<div class="upload-track"><span style={`width:${uploadPercent}%`}></span></div>
+				{#if uploading}
+					<div class="upload-track"><span style={`width:${uploadPercent}%`}></span></div>
+					<div class="upload-actions">
+						<button class="btn ghost" on:click={cancelUpload}>Cancel</button>
+					</div>
+				{/if}
+				{#if uploadRows.length}
+					<ul class="upload-results">
+						{#each uploadRows as row (row.id)}
+							<li class="upload-row {row.status}">
+								<span class="upload-name">{row.name}</span>
+								<span class="upload-status">
+									{row.status === 'uploaded'
+										? 'Uploaded'
+										: row.status === 'failed'
+											? row.error || 'Failed'
+											: row.status === 'unknown'
+												? row.error || 'Unconfirmed — refresh before retrying'
+												: row.status === 'cancelled'
+													? 'Cancelled'
+													: 'Waiting…'}
+								</span>
+							</li>
+						{/each}
+					</ul>
+					{#if !uploading}
+						<div class="upload-actions">
+							<button class="btn ghost" on:click={dismissUploadResults}>Dismiss</button>
+						</div>
+					{/if}
+				{/if}
 			</div>
 		{/if}
 
@@ -860,7 +1294,14 @@
 			</div>
 		{/if}
 
-		{#if !booted || loading}
+		{#if !booted && bootError}
+			<div class="center">
+				<div class="empty-card">
+					<h2>Files are unavailable</h2>
+					<p>Check the server connection, then retry.</p>
+				</div>
+			</div>
+		{:else if !booted || loading}
 			<div class="center"><div class="spinner"></div></div>
 		{:else if searchMode}
 			<div class="content-scroll">
@@ -871,20 +1312,32 @@
 					</div>
 				{:else}
 					<div class="result-list">
-						{#each searchResults as result (result.id)}
+						{#each shownSearchResults as result (result.id)}
 							<button class="result-row" on:click={() => openItem(result)}>
 								<span class="badge">{result.kind === 'folder' ? 'DIR' : extensionOf(result.name)}</span>
 								<span class="result-main">
 									<span class="result-name">{result.name}</span>
 									<span class="result-path">{result.path || '—'}</span>
 									{#if result.snippet}
-										<span class="result-snippet">{@html result.snippet}</span>
+										<span class="result-snippet">{@html snippetHtml(result.snippet)}</span>
 									{/if}
 								</span>
 								<span class="result-size">{result.kind === 'file' ? formatBytes(result.size) : ''}</span>
 							</button>
 						{/each}
 					</div>
+					{#if searchResults.length > shownSearchResults.length}
+						<div class="load-more">
+							<span>Showing {shownSearchResults.length} of {searchResults.length} results</span>
+							<button
+								class="btn"
+								on:click={() =>
+									(renderLimit = Math.min(searchResults.length, renderLimit + RENDER_BATCH))}
+							>
+								Show more
+							</button>
+						</div>
+					{/if}
 				{/if}
 			</div>
 		{:else if view === 'drive'}
@@ -900,7 +1353,7 @@
 					</div>
 				{:else if layout === 'grid'}
 					<div class="card-grid">
-						{#each items as item (item.id)}
+						{#each shownItems as item (item.id)}
 							<div class="file-card" class:selected={selectedId === item.id}>
 								<button class="card-main" on:click={() => openItem(item)} title={item.name}>
 									<span class="thumb">
@@ -923,7 +1376,7 @@
 									{/if}
 								</button>
 								<div class="card-actions">
-									<button class="mini-btn" title="Share" on:click={() => openShare(item)}>↗</button>
+									<button class="mini-btn" title="Share" on:click={(event) => openShare(item, event)}>↗</button>
 									<button class="mini-btn" title="Rename" on:click={() => renameItem(item)}>✎</button>
 									<button class="mini-btn danger" title="Delete" on:click={() => deleteItem(item)}>×</button>
 								</div>
@@ -935,7 +1388,7 @@
 						<div class="row row-head">
 							<span>Name</span><span>Size</span><span>Modified</span><span></span>
 						</div>
-						{#each items as item (item.id)}
+						{#each shownItems as item (item.id)}
 							<div class="row" class:selected={selectedId === item.id}>
 								<button class="row-main" on:click={() => openItem(item)}>
 									<span class="badge">{item.kind === 'folder' ? 'DIR' : extensionOf(item.name)}</span>
@@ -944,13 +1397,26 @@
 								<span class="row-size">{item.kind === 'file' ? formatBytes(item.size) : '—'}</span>
 								<span class="row-date">{formatDate(item.updated_at)}</span>
 								<span class="row-actions">
-									<button class="mini-btn" title="Share" on:click={() => openShare(item)}>↗</button>
+									<button class="mini-btn" title="Share" on:click={(event) => openShare(item, event)}>↗</button>
 									<button class="mini-btn" title="Rename" on:click={() => renameItem(item)}>✎</button>
 									<button class="mini-btn danger" title="Delete" on:click={() => deleteItem(item)}>×</button>
 								</span>
 							</div>
 						{/each}
 					</div>
+				{/if}
+				{#if items.length > shownItems.length || nextOffset !== null}
+					<div class="load-more">
+						<span>
+							Showing {shownItems.length} of {items.length} loaded item{items.length === 1 ? '' : 's'}{nextOffset !== null ? '…' : ''}
+						</span>
+						<button class="btn" on:click={showMoreItems} disabled={loadingMore}>
+							{loadingMore ? 'Loading…' : 'Show more'}
+						</button>
+					</div>
+					{#if loadMoreError}
+						<div class="banner" style="margin: 8px 0 0;">{loadMoreError}</div>
+					{/if}
 				{/if}
 			</div>
 		{:else if view === 'recent'}
@@ -959,7 +1425,7 @@
 					<div class="empty-card"><h2>Nothing recent</h2><p>Uploaded files will appear here.</p></div>
 				{:else}
 					<div class="result-list">
-						{#each recent as item (item.id)}
+						{#each shownRecent as item (item.id)}
 							<button class="result-row" on:click={() => selectFile(item.id)}>
 								<span class="badge">{extensionOf(item.name)}</span>
 								<span class="result-main">
@@ -971,6 +1437,17 @@
 							</button>
 						{/each}
 					</div>
+					{#if recent.length > shownRecent.length}
+						<div class="load-more">
+							<span>Showing {shownRecent.length} of {recent.length} files</span>
+							<button
+								class="btn"
+								on:click={() => (renderLimit = Math.min(recent.length, renderLimit + RENDER_BATCH))}
+							>
+								Show more
+							</button>
+						</div>
+					{/if}
 				{/if}
 			</div>
 		{:else}
@@ -982,7 +1459,7 @@
 					</div>
 				{:else}
 					<div class="result-list">
-						{#each shares as share (share.id)}
+						{#each shownShares as share (share.id)}
 							<div class="share-row">
 								<span class="badge">{share.target_type === 'folder' ? 'DIR' : 'FILE'}</span>
 								<span class="result-main">
@@ -1011,6 +1488,17 @@
 							</div>
 						{/each}
 					</div>
+					{#if shares.length > shownShares.length}
+						<div class="load-more">
+							<span>Showing {shownShares.length} of {shares.length} links</span>
+							<button
+								class="btn"
+								on:click={() => (renderLimit = Math.min(shares.length, renderLimit + RENDER_BATCH))}
+							>
+								Show more
+							</button>
+						</div>
+					{/if}
 				{/if}
 			</div>
 		{/if}
@@ -1042,7 +1530,7 @@
 					{:else if isAudio(selected.item.mime)}
 						<audio class="preview-audio" controls src={fileContentUrl(selected.item.id)}></audio>
 					{:else if isTexty(selected.item.mime)}
-						<pre class="preview-text">{previewLoading ? 'Loading…' : previewText || selected.item.text_preview || 'No text preview.'}</pre>
+						<pre class="preview-text">{previewDisplay}</pre>
 					{:else}
 						<div class="preview-none">
 							<span class="badge big">{extensionOf(selected.item.name)}</span>
@@ -1053,7 +1541,7 @@
 
 				<div class="detail-actions">
 					<a class="btn primary" href={fileDownloadUrl(selected.item.id)} download={selected.item.name}>Download</a>
-					<button class="btn" on:click={() => { const node = detailsNode(); if (node) openShare(node); }}>Share</button>
+					<button class="btn" on:click={(event) => { const node = detailsNode(); if (node) openShare(node, event); }}>Share</button>
 					<button class="btn" on:click={() => { const node = detailsNode(); if (node) renameItem(node); }}>Rename</button>
 					<button class="btn danger" on:click={() => { const node = detailsNode(); if (node) deleteItem(node); }}>Delete</button>
 				</div>
@@ -1138,7 +1626,7 @@
 					<div class="detail-section">
 						<h3>Metadata</h3>
 						<dl class="kv metadata">
-							{#each metaRows as row (row.key)}
+							{#each metaRows as row, index (`${row.key}:${index}`)}
 								<dt title={row.key}>{row.key}</dt>
 								<dd title={row.value}>{row.value}</dd>
 							{/each}
@@ -1166,7 +1654,7 @@
 							{/each}
 						</div>
 					{/if}
-					<button class="btn" on:click={() => detailsNode() && openShare(detailsNode()!)}>New share link</button>
+					<button class="btn" on:click={(event) => { const node = detailsNode(); if (node) openShare(node, event); }}>New share link</button>
 				</div>
 			</div>
 		</aside>
@@ -1178,19 +1666,27 @@
 		class="modal-backdrop"
 		role="presentation"
 		on:click={(event) => {
-			if (event.currentTarget === event.target) shareOpen = false;
+			if (event.currentTarget === event.target) closeShare();
 		}}
 	>
-		<div class="modal" role="dialog" aria-modal="true" aria-label="Share">
+		<div
+			class="modal"
+			role="dialog"
+			aria-modal="true"
+			aria-labelledby="share-title"
+			bind:this={dialogEl}
+			tabindex="-1"
+			on:keydown={onDialogKeydown}
+		>
 			<div class="modal-head">
 				<div>
-					<h2>Share “{shareTarget.name}”</h2>
+					<h2 id="share-title">Share “{shareTarget.name}”</h2>
 					<p class="detail-note">
 						Anyone with the link can {shareTarget.kind === 'folder' ? 'browse and download this folder' : 'download this file'}.
 						Search metadata, extracted text, and image descriptions stay private.
 					</p>
 				</div>
-				<button class="btn ghost" on:click={() => (shareOpen = false)}>✕</button>
+				<button class="btn ghost" aria-label="Close share dialog" on:click={closeShare}>✕</button>
 			</div>
 
 			{#if shareError}
@@ -1246,7 +1742,7 @@
 			{/if}
 
 			<div class="modal-foot">
-				<button class="btn ghost" on:click={() => (shareOpen = false)}>Close</button>
+				<button class="btn ghost" on:click={closeShare}>Close</button>
 			</div>
 		</div>
 	</div>

@@ -1,0 +1,133 @@
+# Production-style deployment example: TLS proxy on the edge, no published
+# Nimbo port, and no plain-HTTP access to the application.
+#
+# This file is intentionally standalone rather than an override, because
+# removing the published port from the development file depends on Compose
+# features that older clients do not implement. Use it as the production
+# starting point:
+#
+#   cd docker
+#   cp ../.env.example .env
+#   # set NIMBO_IMAGE and NIMBO_DOMAIN, then append a NIMBO_SETUP_TOKEN
+#   docker compose -f docker-compose.production.yml pull
+#   docker compose -f docker-compose.production.yml up -d
+#
+# TLS certificates are operator-supplied. Place fullchain.pem and privkey.pem
+# in NIMBO_TLS_DIR (default ./tls) and reload the proxy after renewal:
+#   docker compose -f docker-compose.production.yml exec proxy nginx -s reload
+name: nimbo
+
+services:
+  nimbo:
+    # Use a published release image, never a moving tag in production. Example:
+    #   NIMBO_IMAGE=ghcr.io/barrydeen/nimbo:0.2.0
+    image: "${NIMBO_IMAGE:?Set NIMBO_IMAGE to a published version tag}"
+    container_name: nimbo
+    # No host port. Only the proxy network can reach the backend.
+    expose:
+      - "8080"
+    volumes:
+      - nimbo_data:/data
+    environment:
+      NIMBO_BIND: "0.0.0.0:8080"
+      # The only supported browser entry point is the HTTPS proxy.
+      NIMBO_SECURE_COOKIES: "true"
+      NIMBO_SETUP_TOKEN: "${NIMBO_SETUP_TOKEN:?Set a one-time setup token generated with openssl rand -hex 32}"
+      NIMBO_SESSION_TTL_DAYS: "${NIMBO_SESSION_TTL_DAYS:-30}"
+      NIMBO_AUDIT_RETENTION_DAYS: "${NIMBO_AUDIT_RETENTION_DAYS:-90}"
+      NIMBO_MAX_UPLOAD_MB: "${NIMBO_MAX_UPLOAD_MB:-200}"
+      RUST_LOG: "${NIMBO_LOG:-nimbo=info,tower_http=info}"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "${NIMBO_CPUS:-2.0}"
+          memory: "${NIMBO_MEMORY:-2g}"
+          pids: 512
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - backend
+
+  proxy:
+    # Digest-pinned default; override only with a reviewed tag/digest. The
+    # template file is rendered by the official image's envsubst entrypoint.
+    image: "${NIMBO_PROXY_IMAGE:-nginx:1.28-alpine@sha256:a8b39bd9cf0f83869a2162827a0caf6137ddf759d50a171451b335cecc87d236}"
+    container_name: nimbo-proxy
+    # Run as the image's unprivileged nginx user instead of root. Internal
+    # listeners are 8080/8443, so no NET_BIND_SERVICE capability is needed.
+    # The tmpfs mounts below are owned by 101:101 because the entrypoint writes
+    # the rendered config, pid file and cache entries there.
+    user: "101:101"
+    depends_on:
+      nimbo:
+        condition: service_healthy
+    ports:
+      - "${NIMBO_EDGE_BIND:-0.0.0.0}:${NIMBO_HTTP_PORT:-80}:8080"
+      - "${NIMBO_EDGE_BIND:-0.0.0.0}:${NIMBO_HTTPS_PORT:-443}:8443"
+    environment:
+      NIMBO_DOMAIN: "${NIMBO_DOMAIN:?Set NIMBO_DOMAIN to the public DNS name}"
+      # Must be at least Nimbo's per-request multipart cap. The application
+      # still enforces NIMBO_MAX_UPLOAD_MB per file and returns 413 itself.
+      NIMBO_PROXY_BODY_LIMIT: "${NIMBO_PROXY_BODY_LIMIT:-201m}"
+    volumes:
+      - ./nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - "${NIMBO_TLS_DIR:-./tls}:/etc/nginx/tls:ro"
+    restart: unless-stopped
+    stop_grace_period: 10s
+    read_only: true
+    tmpfs:
+      # The official entrypoint writes the rendered config into this directory.
+      - /etc/nginx/conf.d:rw,noexec,nosuid,size=1m,uid=101,gid=101,mode=0750
+      # Worker temp/cache paths and the pid file need a writable owner.
+      - /var/cache/nginx:rw,noexec,nosuid,size=64m,uid=101,gid=101,mode=0750
+      - /var/run:rw,noexec,nosuid,size=1m,uid=101,gid=101,mode=0750
+      - /tmp:rw,noexec,nosuid,size=1m,uid=101,gid=101,mode=0750
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "${NIMBO_PROXY_CPUS:-1.0}"
+          memory: "${NIMBO_PROXY_MEMORY:-256m}"
+    healthcheck:
+      test: ["CMD-SHELL", "nginx -t"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - backend
+
+volumes:
+  nimbo_data:
+    name: nimbo_nimbo_data
+
+networks:
+  backend:
+    name: nimbo_backend

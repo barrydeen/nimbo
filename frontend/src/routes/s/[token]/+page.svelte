@@ -7,84 +7,157 @@
 		publicDownloadUrl,
 		publicThumbUrl,
 		publicZipUrl,
-		type FileNode,
+		type PublicFileNode,
 		type PublicListing,
 		type PublicShare
 	} from '$lib/api';
+	import { RequestScope, isAbortError } from '$lib/generations';
+	import {
+		PREVIEW_MAX_BYTES,
+		PREVIEW_PREFIX_BYTES,
+		readTextPrefix,
+		truncateCodePoints,
+		type PreviewState
+	} from '$lib/preview';
 
 	let token = '';
 	let loading = true;
 	let errorMsg = '';
 	let share: PublicShare | null = null;
 	let listing: PublicListing | null = null;
-	let selected: FileNode | null = null;
+	let selected: PublicFileNode | null = null;
 	let previewText = '';
-	let previewLoading = false;
+	let previewState: PreviewState = 'idle';
+	let renderLimit = 200;
+	let truncated = false;
+	let disposed = false;
+	const RENDER_BATCH = 200;
+
+	const loadScope = new RequestScope();
+	const folderScope = new RequestScope();
+	const previewScope = new RequestScope();
+
+	$: shownItems = listing ? listing.items.slice(0, renderLimit) : [];
+	$: previewDisplay = (() => {
+		if (previewState === 'loading') return 'Loading…';
+		if (previewState === 'loaded') return previewText || 'Empty file.';
+		if (previewState === 'too-large')
+			return 'Preview unavailable: this file is larger than 2 MB. Download it to view the contents.';
+		if (previewState === 'error') return 'Preview unavailable. Download the file to view it.';
+		if (previewState === 'empty') return 'Empty file.';
+		return 'No text preview.';
+	})();
 
 	onMount(() => {
+		disposed = false;
 		token = $page.params.token ?? '';
-		load();
+		void load();
+		return () => {
+			disposed = true;
+			loadScope.invalidate();
+			folderScope.invalidate();
+			previewScope.invalidate();
+		};
 	});
 
+	function message(err: unknown): string {
+		return err instanceof Error && err.message ? err.message : 'This link is not available.';
+	}
+
 	async function load() {
+		const op = loadScope.begin();
 		loading = true;
 		errorMsg = '';
 		try {
-			share = await api.publicShare(token);
-			if (share.kind === 'file' && share.file) {
-				selected = share.file;
-				loadTextPreview(share.file);
-			} else if (share.folder) {
+			const result = await api.publicShare(token, op.signal);
+			if (!loadScope.isCurrent(op.id)) return;
+			share = result;
+			renderLimit = RENDER_BATCH;
+			if (result.kind === 'file' && result.file) {
+				selected = result.file;
+				void loadTextPreview(result.file);
+			} else if (result.folder) {
 				listing = {
-					folder: share.folder,
-					breadcrumbs: share.breadcrumbs ?? [],
-					items: share.items ?? []
+					folder: result.folder,
+					breadcrumbs: result.breadcrumbs ?? [],
+					items: result.items ?? [],
+					truncated: result.truncated === true
 				};
+				truncated = result.truncated === true;
 			}
-			document.title = `${share.name} · ${share.instance_name}`;
+			document.title = `${result.name} · ${result.instance_name}`;
 		} catch (err) {
-			errorMsg = err instanceof Error ? err.message : 'This link is not available.';
+			if (isAbortError(err) || !loadScope.isCurrent(op.id)) return;
+			errorMsg = message(err);
 		} finally {
-			loading = false;
+			if (loadScope.isCurrent(op.id)) loading = false;
 		}
 	}
 
 	async function openFolder(id: string) {
+		const op = folderScope.begin();
 		errorMsg = '';
 		selected = null;
+		previewScope.invalidate();
 		previewText = '';
+		previewState = 'idle';
 		loading = true;
+		renderLimit = RENDER_BATCH;
 		try {
-			listing = await api.publicNodes(token, id);
+			const result = await api.publicNodes(token, id, op.signal);
+			if (!folderScope.isCurrent(op.id)) return;
+			listing = result;
+			truncated = result.truncated === true;
 		} catch (err) {
-			errorMsg = err instanceof Error ? err.message : 'Could not open this folder.';
+			if (isAbortError(err) || !folderScope.isCurrent(op.id)) return;
+			errorMsg = message(err);
 		} finally {
-			loading = false;
+			if (folderScope.isCurrent(op.id)) loading = false;
 		}
 	}
 
-	function openFile(file: FileNode) {
+	function openFile(file: PublicFileNode) {
+		folderScope.abort();
 		selected = file;
 		previewText = '';
-		loadTextPreview(file);
+		previewState = 'idle';
+		void loadTextPreview(file);
 	}
 
-	async function loadTextPreview(file: FileNode) {
-		if (!isTexty(file.mime) || file.size > 2_000_000) return;
-		previewLoading = true;
-		try {
-			const res = await fetch(publicContentUrl(token, file.id));
-			if (!res.ok) return;
-			const text = await res.text();
-			if (selected?.id === file.id) {
-				previewText =
-					text.length > 120_000 ? `${text.slice(0, 120_000)}\n… (truncated)` : text;
-			}
-		} catch {
-			previewText = '';
-		} finally {
-			previewLoading = false;
+	async function loadTextPreview(file: PublicFileNode) {
+		const op = previewScope.begin();
+		if (!isTexty(file.mime)) return;
+		if (file.size > PREVIEW_MAX_BYTES) {
+			previewState = 'too-large';
+			return;
 		}
+		if (file.size === 0) {
+			previewState = 'empty';
+			return;
+		}
+		previewState = 'loading';
+		try {
+			const res = await fetch(publicContentUrl(token, file.id), {
+				headers: { Range: `bytes=0-${PREVIEW_PREFIX_BYTES - 1}` },
+				signal: op.signal
+			});
+			if (!res.ok) throw new Error(`Preview failed (${res.status})`);
+			const { text, truncated } = await readTextPrefix(res, PREVIEW_PREFIX_BYTES);
+			if (!previewScope.isCurrent(op.id) || selected?.id !== file.id) return;
+			const limited = truncateCodePoints(text, 120_000);
+			previewText = limited.truncated || truncated ? `${limited.text}\n… (truncated)` : text;
+			previewState = previewText ? 'loaded' : 'empty';
+		} catch (err) {
+			if (isAbortError(err) || !previewScope.isCurrent(op.id)) return;
+			previewState = 'error';
+		}
+	}
+
+	function closePreview() {
+		previewScope.invalidate();
+		selected = null;
+		previewText = '';
+		previewState = 'idle';
 	}
 
 	function formatBytes(bytes: number): string {
@@ -241,7 +314,7 @@
 								src={publicContentUrl(token, share.file.id)}
 							></audio>
 						{:else if isTexty(share.file.mime)}
-							<pre class="preview-text">{previewLoading ? 'Loading…' : previewText || 'Empty file'}</pre>
+							<pre class="preview-text">{previewDisplay}</pre>
 						{:else}
 							<div class="preview-none">
 								<span class="badge big">{extensionOf(share.file.name)}</span>
@@ -261,7 +334,7 @@
 							<div class="empty-folder">This folder is empty.</div>
 						{:else}
 							<div class="card-grid">
-								{#each listing.items as item (item.id)}
+								{#each shownItems as item (item.id)}
 									<div class="public-card" class:selected={selected?.id === item.id}>
 										<button
 											class="card-main"
@@ -296,6 +369,24 @@
 									</div>
 								{/each}
 							</div>
+							{#if listing.items.length > shownItems.length}
+								<div class="load-more">
+									<span>Showing {shownItems.length} of {listing.items.length} items</span>
+									<button
+										class="btn"
+										on:click={() => (renderLimit = Math.min(listing!.items.length, renderLimit + RENDER_BATCH))}
+									>
+										Show more
+									</button>
+								</div>
+							{:else if truncated}
+								<div class="load-more">
+									<span>
+										Showing the first {listing.items.length} items. The folder contains more
+										than the public listing limit; download the folder to see everything.
+									</span>
+								</div>
+							{/if}
 						{/if}
 					</div>
 
@@ -303,7 +394,7 @@
 						<aside class="public-details">
 							<div class="details-head">
 								<span class="details-title" title={selected.name}>{selected.name}</span>
-								<button class="btn ghost" on:click={() => (selected = null)}>✕</button>
+								<button class="btn ghost" on:click={closePreview}>✕</button>
 							</div>
 							<div class="details-body">
 								<div class="public-preview">
@@ -333,7 +424,7 @@
 											src={publicContentUrl(token, selected.id)}
 										></audio>
 									{:else if isTexty(selected.mime)}
-										<pre class="preview-text">{previewLoading ? 'Loading…' : previewText || 'Empty file'}</pre>
+										<pre class="preview-text">{previewDisplay}</pre>
 									{:else}
 										<div class="preview-none">
 											<span class="badge big">{extensionOf(selected.name)}</span>

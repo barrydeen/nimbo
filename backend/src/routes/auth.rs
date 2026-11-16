@@ -6,14 +6,17 @@ use crate::{
     util::json_response,
 };
 use axum::{
-    extract::{Extension, State},
+    extract::{ConnectInfo, Extension, State},
     http::{HeaderMap, StatusCode},
     response::Response,
     Json,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::{
+    net::SocketAddr,
+    sync::{Arc, MutexGuard},
+};
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -21,38 +24,64 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+fn lock_limiter(state: &AppState) -> Result<MutexGuard<'_, auth::LoginLimiter>, ApiError> {
+    state
+        .login_limiter
+        .lock()
+        .map_err(|_| ApiError::internal("login limiter is unavailable"))
+}
+
 pub async fn login(
     State(state): State<Arc<AppState>>,
+    connect: ConnectInfo<SocketAddr>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
-    let username = req.username.trim().to_string();
-    let key = username.to_lowercase();
+    let username = auth::normalize_login_username(&req.username)?;
+    if req.password.len() > auth::MAX_PASSWORD_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "password must be at most {} bytes",
+            auth::MAX_PASSWORD_BYTES
+        )));
+    }
 
-    auth::check_rate_limit(&state, &key)?;
+    let account_key = auth::login_account_key(&state.secret, &username);
+    let source_key = connect.0.ip().to_string();
+    let decision = lock_limiter(&state)?.begin(&account_key, &source_key);
+    if decision == auth::LoginDecision::Limited {
+        return Err(ApiError::too_many());
+    }
 
-    let row: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT id, username, password_hash FROM users WHERE lower(username) = lower(?)",
+    let row: Option<(String, String, String, String)> = sqlx::query_as(
+        "SELECT id, username, role, password_hash FROM users WHERE lower(username) = lower(?)",
     )
     .bind(&username)
     .fetch_optional(&state.pool)
     .await?;
 
-    let Some((id, canonical_username, password_hash)) = row else {
-        auth::record_failure(&state, &key);
-        return Err(ApiError::unauthorized());
+    let verified = match row.as_ref() {
+        Some((_, _, _, password_hash)) => {
+            auth::verify_password_bounded(&state, password_hash, &req.password).await?
+        }
+        None => {
+            // Spend comparable work for unknown usernames; the result is ignored.
+            let _ =
+                auth::verify_password_bounded(&state, &state.dummy_password_hash, &req.password)
+                    .await;
+            false
+        }
     };
 
-    if !auth::verify_password(&password_hash, &req.password) {
-        auth::record_failure(&state, &key);
+    let Some((id, canonical_username, role, _)) = row else {
+        return Err(ApiError::unauthorized());
+    };
+    if !verified {
         return Err(ApiError::unauthorized());
     }
 
-    auth::clear_failures(&state, &key);
-
-    let role: (String,) = sqlx::query_as("SELECT role FROM users WHERE id = ?")
-        .bind(&id)
-        .fetch_one(&state.pool)
-        .await?;
+    {
+        let mut limiter = lock_limiter(&state)?;
+        limiter.clear_account(&account_key);
+    }
 
     let token = auth::create_session(&state.pool, &id, state.cfg.session_ttl_secs).await?;
     let cookie = auth::session_cookie(&token, state.cfg.session_ttl_secs, state.cfg.secure_cookies);
@@ -60,7 +89,7 @@ pub async fn login(
     Ok(json_response(
         StatusCode::OK,
         json!({
-            "user": { "id": id, "username": canonical_username, "role": role.0 }
+            "user": { "id": id, "username": canonical_username, "role": role }
         }),
         Some(cookie),
     ))

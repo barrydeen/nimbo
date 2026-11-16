@@ -7,13 +7,19 @@
 	import { indentWithTab } from '@codemirror/commands';
 	import { autocompletion, completionStatus, type CompletionContext } from '@codemirror/autocomplete';
 	import { oneDark } from '@codemirror/theme-one-dark';
-	import { api } from '$lib/api';
+	import { api, errorMessage, isUnauthorized } from '$lib/api';
+	import {
+		isRangeAction,
+		isRangeResultStale,
+		processedSpan
+	} from '$lib/editor-preserve';
 
 	export let value = '';
 	export let docPaths: string[] = [];
 	export let aiEnabled = false;
 	export let onchange: (next: string) => void = () => {};
 	export let onsave: () => void = () => {};
+	export let onunauthorized: () => void = () => {};
 
 	type Ghost = { from: number; text: string } | null;
 	type AgentResult = {
@@ -22,6 +28,9 @@
 		from: number;
 		to: number;
 		original: string;
+		processedChars: number | null;
+		truncated: boolean;
+		version: number;
 	};
 
 	const setGhost = StateEffect.define<Ghost>();
@@ -71,13 +80,27 @@
 	let suggestBusy = false;
 	let suggestPending = false;
 	let suggestSeq = 0;
+	let suggestAbort: AbortController | null = null;
 
 	let agentBusy = '';
 	let agentError = '';
 	let agentResult: AgentResult | null = null;
+	let agentAbort: AbortController | null = null;
+	let docVersion = 0;
+
+	$: agentStale =
+		!!agentResult &&
+		isRangeAction(agentResult.action) &&
+		isRangeResultStale(agentResult.action, agentResult.version, docVersion);
 
 	function message(err: unknown): string {
-		return err instanceof Error ? err.message : 'Something went wrong';
+		return errorMessage(err);
+	}
+
+	function cancelSuggestion() {
+		suggestAbort?.abort();
+		suggestAbort = null;
+		suggestSeq += 1;
 	}
 
 	function wikiSource(context: CompletionContext) {
@@ -145,24 +168,39 @@
 		const selection = current.state.selection.main;
 		if (!selection.empty) return;
 		const cursor = selection.head;
-		const prefix = current.state.sliceDoc(0, cursor);
+		// Only the tail is needed for the provider and for formatting decisions;
+		// avoid stringifying the whole document on every cursor movement.
+		const prefix = current.state.sliceDoc(Math.max(0, cursor - 4000), cursor);
 		if (!prefix.trim()) return;
 
+		cancelSuggestion();
 		const seq = ++suggestSeq;
+		const abort = new AbortController();
+		suggestAbort = abort;
 		const length = current.state.doc.length;
+		const version = docVersion;
 		suggestBusy = true;
 		try {
-			const res = await api.agentAction({ action: 'suggest', text: prefix.slice(-4000) });
-			if (seq !== suggestSeq || !view || !aiEnabled) return;
-			if (view.state.doc.length !== length) return;
+			const res = await api.agentAction(
+				{ action: 'suggest', text: prefix },
+				abort.signal
+			);
+			if (seq !== suggestSeq || abort.signal.aborted || !view || !aiEnabled) return;
+			if (view.state.doc.length !== length || docVersion !== version) return;
 			if (view.state.selection.main.head !== cursor) return;
 			const text = prepareSuggestion(prefix, res.text);
 			if (!text) return;
 			agentError = '';
 			view.dispatch({ effects: setGhost.of({ from: cursor, text }) });
 		} catch (err) {
+			if (abort.signal.aborted) return;
+			if (isUnauthorized(err)) {
+				onunauthorized();
+				return;
+			}
 			if (seq === suggestSeq) agentError = message(err);
 		} finally {
+			if (suggestAbort === abort) suggestAbort = null;
 			suggestBusy = false;
 			if (suggestPending) {
 				suggestPending = false;
@@ -181,7 +219,7 @@
 		} else {
 			clearSuggestTimer();
 			suggestPending = false;
-			suggestSeq += 1;
+			cancelSuggestion();
 			view.dispatch({ effects: setGhost.of(null) });
 		}
 	}
@@ -318,45 +356,94 @@
 			return;
 		}
 
+		agentAbort?.abort();
+		const abort = new AbortController();
+		agentAbort = abort;
+		const version = docVersion;
 		agentBusy = action;
 		agentError = '';
 		agentResult = null;
 		try {
-			const res = await api.agentAction({ action, text });
-			if (!view) return;
-			agentResult = { action, text: res.text.trim(), from, to, original: text };
+			const res = await api.agentAction({ action, text }, abort.signal);
+			if (abort.signal.aborted || !view) return;
+			const reply = res.text.trim();
+			if (!reply) {
+				agentError = 'The provider returned no text. Nothing was changed.';
+				return;
+			}
+			agentResult = {
+				action,
+				text: reply,
+				from,
+				to,
+				original: text,
+				processedChars:
+					typeof res.processed_chars === 'number' ? res.processed_chars : null,
+				truncated: res.truncated === true,
+				version
+			};
 		} catch (err) {
+			if (abort.signal.aborted) return;
+			if (isUnauthorized(err)) {
+				onunauthorized();
+				return;
+			}
 			agentError = message(err);
 		} finally {
+			if (agentAbort === abort) agentAbort = null;
 			agentBusy = '';
 		}
+	}
+
+	function discardResult() {
+		agentResult = null;
+		agentError = '';
 	}
 
 	function applyResult() {
 		const current = view;
 		const result = agentResult;
 		if (!current || !result) return;
-		agentResult = null;
 
-		if (result.action === 'grammar' || result.action === 'rewrite') {
-			const stillThere = current.state.sliceDoc(result.from, result.to) === result.original;
-			if (stillThere) {
-				current.dispatch({
-					changes: { from: result.from, to: result.to, insert: result.text },
-					selection: { anchor: result.from + result.text.length },
-					userEvent: 'input.agent',
-					scrollIntoView: true
-				});
-				current.focus();
+		if (isRangeAction(result.action)) {
+			if (isRangeResultStale(result.action, result.version, docVersion)) {
+				agentResult = null;
+				agentError =
+					'The document changed after this result was generated. Run the action again instead of inserting stale text.';
 				return;
 			}
+			const stillThere = current.state.sliceDoc(result.from, result.to) === result.original;
+			if (!stillThere) {
+				agentResult = null;
+				agentError =
+					'The text this result replaced has changed. Run the action again to avoid losing content.';
+				return;
+			}
+			// Replace only the prefix the provider actually saw. Any suffix beyond
+			// `processed_chars` was never sent and must survive untouched.
+			const span = processedSpan(
+				result.original,
+				result.from,
+				result.processedChars,
+				result.truncated
+			);
+			agentResult = null;
+			current.dispatch({
+				changes: { from: span.from, to: span.to, insert: result.text },
+				selection: { anchor: result.from + result.text.length },
+				userEvent: 'input.agent',
+				scrollIntoView: true
+			});
+			current.focus();
+			return;
 		}
 
-		const atEnd = result.action === 'links' || result.action === 'tags';
-		const pos = atEnd ? current.state.doc.length : current.state.selection.main.head;
+		// Link and tag suggestions append at the end; they never replace text.
+		const pos = current.state.doc.length;
 		const doc = current.state.doc.toString();
 		const needsBreak = pos > 0 && doc[pos - 1] !== '\n';
 		const insert = `${needsBreak ? '\n\n' : ''}${result.text}\n`;
+		agentResult = null;
 		current.dispatch({
 			changes: { from: pos, insert },
 			selection: { anchor: pos + insert.length },
@@ -413,6 +500,8 @@
 					]),
 					EditorView.updateListener.of((update) => {
 						if (update.docChanged) {
+							docVersion += 1;
+							cancelSuggestion();
 							onchange(update.state.doc.toString());
 						}
 						if (update.docChanged || update.selectionSet) {
@@ -452,7 +541,9 @@
 
 		return () => {
 			clearSuggestTimer();
-			suggestSeq += 1;
+			cancelSuggestion();
+			agentAbort?.abort();
+			agentAbort = null;
 			view = null;
 			editor.destroy();
 		};
@@ -547,9 +638,21 @@
 								: 'Tag suggestions'}
 				</span>
 				<div class="spacer"></div>
-				<button class="chip apply" on:click={applyResult}>Apply</button>
-				<button class="chip" on:click={() => (agentResult = null)}>Discard</button>
+				<button class="chip apply" on:click={applyResult} disabled={agentStale}>Apply</button>
+				<button class="chip" on:click={discardResult}>Discard</button>
 			</div>
+			{#if agentStale}
+				<p class="agent-note error">
+					The document changed after this result was generated. Discard it and run the action
+					again; stale text is never inserted.
+				</p>
+			{:else if agentResult.truncated}
+				<p class="agent-note">
+					{agentResult.processedChars !== null
+						? `Only the first ${agentResult.processedChars} characters were processed. Apply replaces that prefix only and keeps the rest of the text unchanged.`
+						: 'Only part of the text was processed. Apply keeps the unprocessed text unchanged.'}
+				</p>
+			{/if}
 			<pre>{agentResult.text}</pre>
 		</div>
 	{/if}

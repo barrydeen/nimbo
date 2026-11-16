@@ -1,19 +1,83 @@
-target/
-node_modules/
-.svelte-kit/
-build/
-dist/
-data/
-.git/
-.github/
-android/
+# Build context hygiene: ship only application sources into the image build.
+# Review notes, tests, CI metadata, runtime data and credentials must never be
+# sent to the Docker daemon or captured in an image layer.
+
+.git
+.gitignore
+.gitattributes
+.github
+.unlazy
+GATES.md
+reports
+scripts
+docker
+android
+docs
+
+# Test, coverage and review artifacts
+**/tests
+**/test
+**/__tests__
+**/*.test.*
+**/*.spec.*
+**/fixtures
+**/coverage
+**/.nyc_output
+**/playwright-report
+**/test-results
+
+# Build outputs and dependency trees
+target
+backend/target
+frontend/node_modules
+**/node_modules
+frontend/.svelte-kit
+**/.svelte-kit
+frontend/build
+**/build
+**/dist
+**/out
+.gradle
+**/.gradle
+
+# Runtime state, databases, keys and local configuration
+data
+**/data
 *.db
 *.db-wal
 *.db-shm
+**/*.db
+**/*.db-wal
+**/*.db-shm
 *.key
+**/*.key
+secret.key
+keystore
+**/keystore
 *.keystore
+**/*.keystore
 *.jks
+**/*.jks
+*.p12
+**/*.p12
+*.pfx
+**/*.pfx
+*.pem
+**/*.pem
+local.properties
+**/local.properties
+
+# Environment files (never include real values)
 .env
 .env.*
+**/.env
+**/.env.*
 !.env.example
-GATES.md
+
+# Documentation and editor noise not needed by the build
+**/*.md
+!frontend/README.md
+**/.DS_Store
+**/Thumbs.db
+**/*.swp
+**/*~

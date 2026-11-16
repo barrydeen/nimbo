@@ -7,6 +7,8 @@
 	let username = '';
 	let password = '';
 	let confirm = '';
+	let setupToken = '';
+	let setupTokenRequired = false;
 	let error = '';
 	let busy = false;
 
@@ -18,6 +20,7 @@
 				return;
 			}
 			instanceName = boot.instance_name || 'Nimbo';
+			setupTokenRequired = boot.setup_token_required === true;
 		} catch {
 			/* first boot, backend may still be starting */
 		}
@@ -34,9 +37,18 @@
 			error = 'Passwords do not match.';
 			return;
 		}
+		if (setupTokenRequired && !setupToken.trim()) {
+			error = 'This server requires the setup token configured by its administrator.';
+			return;
+		}
 		busy = true;
 		try {
-			await api.setup({ instance_name: instanceName, username, password });
+			await api.setup({
+				instance_name: instanceName,
+				username,
+				password,
+				...(setupToken.trim() ? { setup_token: setupToken.trim() } : {})
+			});
 			goto('/vault');
 		} catch (err) {
 			error = err instanceof Error ? err.message : 'Setup failed';
@@ -72,6 +84,22 @@
 					required
 				/>
 			</div>
+			{#if setupTokenRequired}
+				<div class="field">
+					<label for="setup-token">Setup token</label>
+					<input
+						id="setup-token"
+						class="input"
+						bind:value={setupToken}
+						autocomplete="off"
+						required
+					/>
+					<p class="field-hint">
+						This server was started with a bootstrap token. Enter the value from its
+						<code>NIMBO_SETUP_TOKEN</code> environment setting.
+					</p>
+				</div>
+			{/if}
 			<div class="field">
 				<label for="username">Admin username</label>
 				<input

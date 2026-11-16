@@ -60,3 +60,88 @@ pub async fn set_setting(pool: &SqlitePool, key: &str, value: &str) -> Result<()
     .await?;
     Ok(())
 }
+
+/// Startup/periodic maintenance: expired sessions and old audit rows have no
+/// operational value and otherwise grow forever on a long-lived instance.
+pub async fn retention_cleanup(pool: &SqlitePool, audit_retention_days: i64) -> Result<()> {
+    let now = crate::now();
+    let removed_sessions = sqlx::query("DELETE FROM sessions WHERE expires_at <= ?")
+        .bind(now)
+        .execute(pool)
+        .await?
+        .rows_affected();
+
+    let days = audit_retention_days.clamp(1, 3650);
+    let cutoff = now.saturating_sub(days.saturating_mul(86_400));
+    let removed_audit = sqlx::query("DELETE FROM audit_log WHERE at < ?")
+        .bind(cutoff)
+        .execute(pool)
+        .await?
+        .rows_affected();
+
+    if removed_sessions > 0 || removed_audit > 0 {
+        tracing::info!(
+            sessions = removed_sessions,
+            audit_rows = removed_audit,
+            "retention cleanup removed stale rows"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retention_removes_expired_sessions_and_old_audit_rows() {
+        let dir = std::env::temp_dir().join(format!("nimbo-db-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = init(&dir).await.unwrap();
+        let now = crate::now();
+
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at) \
+             VALUES ('u1', 'alice', 'hash', 'admin', ?)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, user_id, token_hash, created_at, expires_at) \
+             VALUES ('s1', 'u1', 'expired', ?, ?), ('s2', 'u1', 'live', ?, ?)",
+        )
+        .bind(now - 100)
+        .bind(now - 1)
+        .bind(now)
+        .bind(now + 3600)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO audit_log (user_id, action, target, at) VALUES \
+             ('u1', 'old', NULL, ?), ('u1', 'new', NULL, ?)",
+        )
+        .bind(now - 200 * 86_400)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        retention_cleanup(&pool, 90).await.unwrap();
+
+        let sessions: Vec<(String,)> = sqlx::query_as("SELECT id FROM sessions")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(sessions, vec![("s2".to_string(),)]);
+        let audit: Vec<(String,)> = sqlx::query_as("SELECT action FROM audit_log")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(audit, vec![("new".to_string(),)]);
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

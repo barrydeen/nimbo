@@ -13,7 +13,7 @@ path = "src/main.rs"
 axum = { version = "0.8", features = ["macros", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["fs", "trace", "compression-gzip"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 argon2 = "0.5"
@@ -21,6 +21,7 @@ rand = "0.8"
 base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"
+libc = "0.2"
 chacha20poly1305 = "0.10"
 anyhow = "1"
 tracing = "0.1"
@@ -43,3 +44,6 @@ lopdf = "0.42.0"
 zip = { version = "9.6.0", default-features = false, features = ["deflate"] }
 quick-xml = "0.42.0"
 lofty = "0.25.5"
+
+[patch.crates-io]
+sqlx-sqlite = { path = "vendor/sqlx-sqlite" }

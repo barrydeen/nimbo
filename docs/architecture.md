@@ -12,8 +12,11 @@ designed to be deployed as one container with one persistent volume.
    `$NIMBO_DATA_DIR/files/blobs/<aa>/<bb>/<sha256>`. The virtual folder tree,
    share links and extraction results live in SQLite. Identical uploads share one
    blob.
-3. **Everything sensitive is encrypted at rest.** Provider API keys are stored
-   with XChaCha20-Poly1305 using an instance secret generated on first boot.
+3. **Provider API keys are encrypted at rest; notes and files are not.**
+   Provider settings are stored with XChaCha20-Poly1305 using an instance secret
+   generated on first boot. Markdown notes, SQLite rows, sessions, uploaded
+   blobs, thumbnails and backups are plaintext. Use host/filesystem encryption
+   and protected backup storage when disk theft or backup exposure is in scope.
 4. **No external services.** SQLite (with FTS5) is embedded; there is no Redis,
    Postgres or Meilisearch requirement for a single-instance deployment.
 5. **Fail closed.** Unknown API routes return JSON 404, mutating cross-origin
@@ -44,15 +47,22 @@ frontend/src
 
 ## Data flow
 
-- **Setup:** a fresh instance has `setup_complete=false`. `POST /api/setup`
-  creates the first admin inside a transaction, flips the flag, and issues a
-  session.
+- **Setup:** a fresh instance has `setup_complete=false`. When
+  `NIMBO_SETUP_TOKEN` is configured, `POST /api/setup` requires that one-time
+  value and compares it in constant time. The first successful request creates
+  the administrator inside a transaction and flips the flag. A completed
+  instance rejects setup before password hashing.
 - **Authentication:** browsers use an HttpOnly session cookie. Native clients
   send `Authorization: Bearer nmb_…`; device tokens are looked up by SHA-256
-  hash, checked for revocation/expiry, and touch `last_used_at` on use.
+  hash, checked for revocation/expiry, and touch `last_used_at` on use. Session
+  tokens have full scope. Device tokens default to full scope for backward
+  compatibility; backup-scoped tokens are confined to the `Phone Backups`
+  subtree and cannot use docs, agent, settings, shares or token administration.
 - **Documents:** saves validate the path, check the supplied content hash against
-  the file on disk (optimistic concurrency), write atomically via temp file +
-  rename, then reindex.
+  the file on disk (optimistic concurrency), write atomically via a unique temp
+  file + no-replace rename, then update the index from the committed bytes. The
+  decoded content is capped at 8 MiB; the route accepts a 16 MiB JSON body so
+  escaping overhead does not disconnect the advertised note limit.
 - **Indexing:** the document row, wikilink graph and FTS5 rows are updated in the
   same request. Dangling links are re-resolved when new documents appear.
 - **Search:** FTS5 with BM25 ranking and `snippet()` highlighting. Queries are
@@ -64,11 +74,17 @@ frontend/src
   links, tags) use the same provider client without tools.
 - **File uploads:** multipart chunks are streamed to a temp file while hashing.
   The completed blob is promoted into the content-addressed store, and a node row
-  is inserted with a sibling-unique name. Duplicate names are suffixed
-  (`file (2).ext`). The request is capped by `NIMBO_MAX_UPLOAD_MB`.
+  is inserted with a sibling-unique name in a lifecycle transaction. Duplicate
+  names are suffixed (`file (2).ext`). The request is capped by
+  `NIMBO_MAX_UPLOAD_MB` per file and by roughly that value plus 1 MiB for the
+  whole multipart request. `PUT /api/files/{id}/content` replaces the bytes of an
+  existing file node while preserving its identity and name.
 - **File indexing:** a background worker claims `index_status='pending'` rows,
   extracts text/metadata/thumbnails in a blocking task, stores the thumbnail as
-  another blob, and refreshes the file's FTS row.
+  another blob, and refreshes the file's FTS row. Parsing applies byte, entry,
+  pixel and expansion caps before dispatch and each job has a five-minute
+  deadline, but native parser work may continue after a deadline; container
+  limits remain the hard backstop.
 - **Image descriptions:** images with `vision_status='pending'` are downscaled
   (EXIF orientation applied), sent to the configured vision model, and stored as
   description, visible text and tags. Missing providers mark images `skipped`;
@@ -76,17 +92,25 @@ frontend/src
 - **Shares:** share IDs are 256-bit random tokens. Public endpoints resolve the
   token, reject revoked/expired links with 410, and verify every requested node is
   the shared file or inside the shared folder. Folder zips are built in a temp
-  file and streamed, capped at 10,000 entries / 4 GiB.
+  file and streamed, capped per archive at 10,000 entries / 4 GiB, with at most
+  two concurrent builds and an 8 GiB aggregate staging budget. They still
+  consume shared disk and CPU and require operator headroom.
 
 ## Threat model notes
 
 - Session tokens are random 256-bit values; only their SHA-256 hashes are stored.
 - Device tokens are random 256-bit `nmb_…` values, stored only as SHA-256
-  hashes. They are revocable and inherit the permissions of their creator.
+  hashes. They are revocable. Full-scope tokens inherit the creator's
+  permissions; backup-scope tokens are confined to the `Phone Backups` subtree.
 - Cookies are `HttpOnly` and `SameSite=Strict`; set `NIMBO_SECURE_COOKIES=true`
-  behind TLS.
+  behind TLS. TLS is not provided by that flag and must be terminated by a
+  reverse proxy or equivalent.
+- First-run setup is claimable by the first reachable client unless
+  `NIMBO_SETUP_TOKEN` is set. Keep the default loopback publication or complete
+  setup through a tunnel/TLS before exposing the service.
 - Path traversal is prevented lexically (`..`, absolute paths, non-`.md`) and
-  files are always joined under the vault root.
+  files are always joined under the vault root, with descriptor-relative checks
+  for final and parent symlinks.
 - The agent is given read-only vault and file context in this version; write
   actions are user-initiated from the UI.
 - Public share responses expose only names, sizes, types and preview/download
@@ -94,10 +118,16 @@ frontend/src
   available only to authenticated users.
 - Inline rendering is restricted to raster images, PDF, audio, video and plain
   text/Markdown/JSON/CSV. HTML, SVG, XML and unknown types are served as
-  attachments with `X-Content-Type-Options: nosniff`.
-- Uploaded data is untrusted input: extraction runs with size/time budgets and
-  parsers are isolated in blocking tasks. Password-protected or malformed files
-  are marked partial rather than failing the upload.
+  attachments with `X-Content-Type-Options: nosniff`. Markdown preview and
+  search snippets are sanitized in the browser.
+- Uploaded data is untrusted input: extraction applies input-size, entry,
+  pixel and expansion caps, and each background job has a five-minute deadline.
+  Blocking parser work cannot be safely preempted by dropping a task handle, so
+  container CPU/memory limits remain the hard backstop. Password-protected or
+  malformed files are marked partial rather than failing the upload.
+- Only provider API keys are encrypted by the application (`secret.key`).
+  Notes, database contents, sessions, blobs and backups are plaintext; protect
+  the volume and backups with host/filesystem encryption.
 - When automatic descriptions are enabled, image bytes leave the instance for the
   configured provider. Operators who need local-only storage should disable the
   feature or point the provider at a local vision model.
@@ -109,6 +139,25 @@ frontend/src
 - No CRDT collaboration: concurrent editors get a 409 instead of a merge.
 - Search is lexical only; semantic retrieval is planned.
 - File uploads are not resumable. Folder zips are generated synchronously before
-  the response starts, so very large folders can take a while and are capped.
+  the response starts, so very large folders can take a while and are capped per
+  archive.
 - All authenticated users have full access to the file drive; there are no
-  per-user or per-folder permissions yet.
+  per-user or per-folder permissions beyond the coarse backup-token scope.
+- Notes, database rows, blobs and backups are not encrypted at rest by the
+  application. Only provider API keys use the instance key. Host/filesystem and
+  backup encryption are operator responsibilities.
+- Parser work is bounded by input caps and a five-minute job deadline, but native
+  parser code cannot be safely preempted by dropping an async task handle.
+  Container CPU/memory limits remain the hard backstop against a hostile parser.
+- Backup/restore is a documented offline runbook, not a built-in scheduling or
+  point-in-time recovery service. There is no supported online backup mode or
+  multi-replica deployment.
+- Expired sessions and audit rows older than `NIMBO_AUDIT_RETENTION_DAYS`
+  (default 90) are purged at startup and periodically. Container logs rotate in
+  the supplied Compose files; external log collectors need their own retention.
+- Android backups are constrained to unmetered networks, which is not the same
+  as a specific Wi-Fi network. Plain HTTP requires an explicit insecure-allow
+  setting and exposes a device credential; use HTTPS.
+- Public folder archives stage data on the same volume as the database. Per
+  archive, concurrency and aggregate staging are capped (10,000 entries / 4 GiB,
+  two builds, 8 GiB aggregate), but there is no per-operator quota.

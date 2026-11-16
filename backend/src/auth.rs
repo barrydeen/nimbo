@@ -5,24 +5,60 @@ use argon2::{
 };
 use axum::{
     extract::{Request, State},
-    http::{header, HeaderMap, Method},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method},
     middleware::Next,
     response::Response,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
-use std::sync::Arc;
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 pub const COOKIE_NAME: &str = "nimbo_session";
 pub const DEVICE_TOKEN_PREFIX: &str = "nmb_";
-const MAX_FAILURES: usize = 5;
-const FAILURE_WINDOW_SECS: i64 = 300;
+
+/// Largest username accepted by the login route. Applied before any allocation
+/// or limiter key derivation.
+pub const MAX_LOGIN_USERNAME_BYTES: usize = 64;
+/// Argon2 cost grows with input length; cap it well above real passphrases.
+pub const MAX_PASSWORD_BYTES: usize = 1024;
+/// Concurrent Argon2 operations allowed per process.
+pub const PASSWORD_HASH_CONCURRENCY: usize = 2;
+
+const ACCOUNT_MAX_ATTEMPTS: usize = 5;
+const ACCOUNT_WINDOW_SECS: i64 = 300;
+/// After the account window is exhausted, a correct password may still be
+/// verified at most once per this cooldown, so lockout is temporary without
+/// turning the locked window into an unlimited guessing oracle.
+const ACCOUNT_BYPASS_COOLDOWN_SECS: i64 = 30;
+const SOURCE_MAX_ATTEMPTS: usize = 20;
+const SOURCE_WINDOW_SECS: i64 = 300;
+const GLOBAL_MAX_ATTEMPTS: usize = 200;
+const GLOBAL_WINDOW_SECS: i64 = 300;
+const MAX_LIMITER_KEYS: usize = 4096;
+const PASSWORD_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const DEVICE_TOKEN_TOUCH_SECS: i64 = 60;
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct AuthUser {
     pub id: String,
     pub username: String,
     pub role: String,
+    /// `full` for browser sessions and ordinary device tokens, `backup` for a
+    /// token restricted to its `Phone Backups` subtree.
+    pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_root_id: Option<String>,
+}
+
+impl AuthUser {
+    pub fn is_backup_scope(&self) -> bool {
+        self.scope == "backup"
+    }
 }
 
 pub fn hash_password(password: &str) -> Result<String, ApiError> {
@@ -41,6 +77,213 @@ pub fn verify_password(hash: &str, password: &str) -> bool {
                 .is_ok()
         })
         .unwrap_or(false)
+}
+
+/// Runs Argon2 hashing on a blocking thread, bounded by the process-wide
+/// semaphore so unauthenticated requests cannot occupy all Tokio workers.
+pub async fn hash_password_bounded(state: &AppState, password: &str) -> Result<String, ApiError> {
+    let permit = acquire_password_permit(state).await?;
+    let password = password.to_string();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        hash_password(&password)
+    })
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "password hashing task failed");
+        ApiError::internal("password hashing failed")
+    })?
+}
+
+/// Constant-time-enough password check on a blocking thread. Returns an error
+/// only when the bounded work queue is unavailable, never password details.
+pub async fn verify_password_bounded(
+    state: &AppState,
+    hash: &str,
+    password: &str,
+) -> Result<bool, ApiError> {
+    let permit = acquire_password_permit(state).await?;
+    let hash = hash.to_string();
+    let password = password.to_string();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        verify_password(&hash, &password)
+    })
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "password verification task failed");
+        ApiError::internal("password verification failed")
+    })
+}
+
+async fn acquire_password_permit(
+    state: &AppState,
+) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
+    tokio::time::timeout(
+        PASSWORD_OPERATION_TIMEOUT,
+        state.password_semaphore.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| ApiError::service_unavailable("password work is busy, try again shortly"))?
+    .map_err(|_| ApiError::service_unavailable("password work is unavailable"))
+}
+
+pub fn validate_password(password: &str) -> Result<(), ApiError> {
+    if password.chars().count() < 8 {
+        return Err(ApiError::bad_request(
+            "password must be at least 8 characters",
+        ));
+    }
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "password must be at most {MAX_PASSWORD_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Trims and bounds a login username before it reaches any limiter allocation.
+pub fn normalize_login_username(raw: &str) -> Result<String, ApiError> {
+    let username = raw.trim();
+    if username.is_empty() {
+        return Err(ApiError::bad_request("username is required"));
+    }
+    if username.len() > MAX_LOGIN_USERNAME_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "username must be at most {MAX_LOGIN_USERNAME_BYTES} bytes"
+        )));
+    }
+    if username.chars().any(char::is_control) {
+        return Err(ApiError::bad_request(
+            "username contains control characters",
+        ));
+    }
+    Ok(username.to_string())
+}
+
+/// Fixed-size limiter key so attacker-supplied usernames never become retained
+/// map entries. The instance secret keeps keys unguessable across restarts.
+pub fn login_account_key(secret: &[u8; 32], username: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(secret);
+    hasher.update([0u8]);
+    hasher.update(username.to_lowercase().as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Compares two strings without an early exit on the first differing byte.
+pub fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left = Sha256::digest(left.as_bytes());
+    let right = Sha256::digest(right.as_bytes());
+    left.iter()
+        .zip(right.iter())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginDecision {
+    /// Attempt reserved; run the normal credential check.
+    Reserved,
+    /// The per-account window is exhausted but its short cooldown has elapsed.
+    /// One verification is permitted (bounded by source/global budgets) so a
+    /// correct password is never permanently locked out by username-only
+    /// failures.
+    VerifyDespiteAccountLimit,
+    /// Source/global budget or account cooldown exhausted; reject without
+    /// hashing.
+    Limited,
+}
+
+/// Bounded login attempt limiter. Attempts are reserved atomically under one
+/// lock; stale entries and whole keys are evicted so memory use is capped.
+#[derive(Debug, Default)]
+pub struct LoginLimiter {
+    accounts: HashMap<String, VecDeque<i64>>,
+    sources: HashMap<String, VecDeque<i64>>,
+    global: VecDeque<i64>,
+}
+
+impl LoginLimiter {
+    pub fn begin(&mut self, account_key: &str, source_key: &str) -> LoginDecision {
+        self.begin_at(crate::now(), account_key, source_key)
+    }
+
+    fn begin_at(&mut self, now: i64, account_key: &str, source_key: &str) -> LoginDecision {
+        prune(&mut self.global, now, GLOBAL_WINDOW_SECS);
+        prune_map(&mut self.accounts, now, ACCOUNT_WINDOW_SECS);
+        prune_map(&mut self.sources, now, SOURCE_WINDOW_SECS);
+
+        let source_attempts = self.sources.get(source_key).map_or(0, VecDeque::len);
+        if self.global.len() >= GLOBAL_MAX_ATTEMPTS || source_attempts >= SOURCE_MAX_ATTEMPTS {
+            return LoginDecision::Limited;
+        }
+
+        let account_attempts = self.accounts.get(account_key).map_or(0, VecDeque::len);
+        if account_attempts >= ACCOUNT_MAX_ATTEMPTS {
+            let last = self
+                .accounts
+                .get(account_key)
+                .and_then(|queue| queue.back())
+                .copied()
+                .unwrap_or(now);
+            if now - last < ACCOUNT_BYPASS_COOLDOWN_SECS {
+                return LoginDecision::Limited;
+            }
+            // One cooldown-gated verification; it counts as a further attempt so
+            // concurrent requests cannot all take the bypass.
+            push_attempt(&mut self.accounts, account_key, now, MAX_LIMITER_KEYS);
+            push_attempt(&mut self.sources, source_key, now, MAX_LIMITER_KEYS);
+            self.global.push_back(now);
+            return LoginDecision::VerifyDespiteAccountLimit;
+        }
+
+        // Reserve the attempt before any database or Argon2 work. This is what
+        // makes concurrent bursts unable to exceed the configured budget.
+        push_attempt(&mut self.sources, source_key, now, MAX_LIMITER_KEYS);
+        self.global.push_back(now);
+        push_attempt(&mut self.accounts, account_key, now, MAX_LIMITER_KEYS);
+        LoginDecision::Reserved
+    }
+
+    pub fn clear_account(&mut self, account_key: &str) {
+        self.accounts.remove(account_key);
+    }
+
+    #[cfg(test)]
+    fn account_attempts(&self, key: &str) -> usize {
+        self.accounts.get(key).map_or(0, VecDeque::len)
+    }
+}
+
+fn prune(queue: &mut VecDeque<i64>, now: i64, window_secs: i64) {
+    while queue
+        .front()
+        .map(|timestamp| now - *timestamp >= window_secs)
+        .unwrap_or(false)
+    {
+        queue.pop_front();
+    }
+}
+
+fn prune_map(map: &mut HashMap<String, VecDeque<i64>>, now: i64, window_secs: i64) {
+    map.retain(|_, queue| {
+        prune(queue, now, window_secs);
+        !queue.is_empty()
+    });
+}
+
+fn push_attempt(map: &mut HashMap<String, VecDeque<i64>>, key: &str, now: i64, max_keys: usize) {
+    if !map.contains_key(key) && map.len() >= max_keys {
+        let victim = map
+            .iter()
+            .min_by_key(|(_, queue)| queue.back().copied().unwrap_or(i64::MIN))
+            .map(|(key, _)| key.to_string());
+        if let Some(victim) = victim {
+            map.remove(&victim);
+        }
+    }
+    map.entry(key.to_string()).or_default().push_back(now);
 }
 
 /// Returns (raw token, stored hash). Only the hash is persisted.
@@ -129,7 +372,13 @@ pub async fn lookup_session(
     .bind(crate::now())
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(id, username, role)| AuthUser { id, username, role }))
+    Ok(row.map(|(id, username, role)| AuthUser {
+        id,
+        username,
+        role,
+        scope: "full".to_string(),
+        backup_root_id: None,
+    }))
 }
 
 pub async fn delete_session(pool: &sqlx::SqlitePool, token: &str) -> Result<(), ApiError> {
@@ -141,15 +390,28 @@ pub async fn delete_session(pool: &sqlx::SqlitePool, token: &str) -> Result<(), 
     Ok(())
 }
 
-/// Resolve a device token (`nmb_…`) to its user, touching `last_used_at`.
+/// (token id, user id, username, role, scope, backup root, last used at)
+type DeviceTokenLookup = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+);
+
+/// Resolve a device token (`nmb_…`) to its user and scope. `last_used_at` is
+/// persisted at most once per minute and never blocks authorization on error.
 pub async fn lookup_device_token(
     pool: &sqlx::SqlitePool,
     token: &str,
 ) -> Result<Option<AuthUser>, ApiError> {
     let token_hash = sha256_hex(token.as_bytes());
     let now = crate::now();
-    let row: Option<(String, String, String, String)> = sqlx::query_as(
-        "SELECT t.id, u.id, u.username, u.role FROM device_tokens t \
+    let row: Option<DeviceTokenLookup> = sqlx::query_as(
+        "SELECT t.id, u.id, u.username, u.role, t.scope, t.backup_root_id, t.last_used_at \
+         FROM device_tokens t \
          JOIN users u ON u.id = t.user_id \
          WHERE t.token_hash = ? AND t.revoked_at IS NULL \
            AND (t.expires_at IS NULL OR t.expires_at > ?)",
@@ -158,15 +420,44 @@ pub async fn lookup_device_token(
     .bind(now)
     .fetch_optional(pool)
     .await?;
-    let Some((token_id, id, username, role)) = row else {
+    let Some((token_id, id, username, role, scope, backup_root_id, last_used_at)) = row else {
         return Ok(None);
     };
-    sqlx::query("UPDATE device_tokens SET last_used_at = ? WHERE id = ?")
+    if scope != "full" && scope != "backup" {
+        tracing::warn!(scope = %scope, "device token has an invalid scope");
+        return Ok(None);
+    }
+    if scope == "backup" && backup_root_id.is_none() {
+        tracing::warn!("backup device token is not bound to a root folder");
+        return Ok(None);
+    }
+
+    if last_used_at
+        .map(|seen| now - seen >= DEVICE_TOKEN_TOUCH_SECS)
+        .unwrap_or(true)
+    {
+        let touched = sqlx::query(
+            "UPDATE device_tokens SET last_used_at = ? WHERE id = ? \
+             AND (last_used_at IS NULL OR last_used_at < ?)",
+        )
         .bind(now)
         .bind(&token_id)
+        .bind(now - DEVICE_TOKEN_TOUCH_SECS)
         .execute(pool)
-        .await?;
-    Ok(Some(AuthUser { id, username, role }))
+        .await;
+        if let Err(err) = touched {
+            // Telemetry is best-effort; a busy database must not reject a valid token.
+            tracing::debug!(error = %err, "could not persist device token last-use time");
+        }
+    }
+
+    Ok(Some(AuthUser {
+        id,
+        username,
+        role,
+        scope,
+        backup_root_id,
+    }))
 }
 
 /// Middleware: rejects requests without valid credentials. Accepts either a
@@ -187,8 +478,26 @@ pub async fn require_session(
             .await?
             .ok_or_else(ApiError::unauthorized)?
     };
+
+    if user.is_backup_scope() && !backup_scope_allows(req.uri().path()) {
+        return Err(ApiError::forbidden(
+            "backup tokens may only access file routes and their own account",
+        ));
+    }
+
     req.extensions_mut().insert(user);
     Ok(next.run(req).await)
+}
+
+/// Backup-scope tokens are deliberately narrow: they can browse/upload inside
+/// their bound subtree and read their own account, but cannot touch documents,
+/// the agent, settings, shares, or token administration.
+pub fn backup_scope_allows(path: &str) -> bool {
+    path == "/api/auth/me"
+        || path == "/api/auth/logout"
+        || path == "/api/instance"
+        || path == "/api/files"
+        || path.starts_with("/api/files/")
 }
 
 /// Middleware: rejects cross-origin mutating requests.
@@ -220,27 +529,75 @@ pub async fn origin_check(
     Ok(next.run(req).await)
 }
 
-/// Basic in-memory brute-force protection keyed by username.
-pub fn check_rate_limit(state: &AppState, key: &str) -> Result<(), ApiError> {
-    let now = crate::now();
-    let mut guard = state.login_failures.lock().expect("limiter lock");
-    let failures = guard.entry(key.to_string()).or_default();
-    failures.retain(|t| now - *t < FAILURE_WINDOW_SECS);
-    if failures.len() >= MAX_FAILURES {
-        return Err(ApiError::too_many());
+/// Ensures `/api/*` framework failures (body-limit, method, extractor
+/// rejections) use the same `{ "error": ... }` JSON shape as ApiError instead of
+/// leaking plain-text framework bodies. Internal details are never included.
+pub async fn json_error_shape(req: Request, next: Next) -> Response {
+    let is_api = req.uri().path().starts_with("/api/");
+    let response = next.run(req).await;
+    if !is_api {
+        return response;
     }
-    Ok(())
+    if !(response.status().is_client_error() || response.status().is_server_error()) {
+        return response;
+    }
+    let already_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.starts_with("application/json"))
+        .unwrap_or(false);
+    if already_json {
+        return response;
+    }
+
+    let status = response.status();
+    let body = serde_json::json!({
+        "error": status.canonical_reason().unwrap_or("request failed"),
+    })
+    .to_string();
+    let (mut parts, _) = response.into_parts();
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, axum::body::Body::from(body))
 }
 
-pub fn record_failure(state: &AppState, key: &str) {
-    let now = crate::now();
-    let mut guard = state.login_failures.lock().expect("limiter lock");
-    guard.entry(key.to_string()).or_default().push(now);
-}
+/// Global browser hardening. Same-origin framing is intentional: the SPA
+/// renders same-origin PDF previews in an iframe. External origins remain
+/// blocked by both `X-Frame-Options` and CSP `frame-ancestors`.
+const SECURITY_HEADERS: &[(&str, &str)] = &[
+    ("x-content-type-options", "nosniff"),
+    ("x-frame-options", "SAMEORIGIN"),
+    ("referrer-policy", "no-referrer"),
+    (
+        "permissions-policy",
+        "camera=(), microphone=(), geolocation=(), payment=()",
+    ),
+    (
+        "content-security-policy",
+        "default-src 'self'; base-uri 'none'; object-src 'none'; \
+         frame-ancestors 'self'; form-action 'self'; \
+         img-src 'self' data: blob:; media-src 'self' blob:; \
+         style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; \
+         connect-src 'self'; font-src 'self' data:; worker-src 'self' blob:; \
+         manifest-src 'self'",
+    ),
+];
 
-pub fn clear_failures(state: &AppState, key: &str) {
-    let mut guard = state.login_failures.lock().expect("limiter lock");
-    guard.remove(key);
+/// Safe response headers applied to API and static responses alike. The CSP is
+/// a defense-in-depth backstop; stored HTML is sanitized by the frontend.
+pub async fn security_headers(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    for &(name, value) in SECURITY_HEADERS {
+        headers
+            .entry(HeaderName::from_static(name))
+            .or_insert(HeaderValue::from_static(value));
+    }
+    response
 }
 
 #[cfg(test)]
@@ -255,11 +612,168 @@ mod tests {
     }
 
     #[test]
+    fn password_length_bounds() {
+        assert!(validate_password("short").is_err());
+        assert!(validate_password("long enough").is_ok());
+        assert!(validate_password(&"a".repeat(MAX_PASSWORD_BYTES + 1)).is_err());
+    }
+
+    #[test]
     fn tokens_are_unique_and_hashed() {
         let (a, ha) = new_token();
         let (b, hb) = new_token();
         assert_ne!(a, b);
         assert_ne!(ha, hb);
         assert_eq!(ha, sha256_hex(a.as_bytes()));
+    }
+
+    #[test]
+    fn constant_time_comparison() {
+        assert!(constant_time_eq("abc", "abc"));
+        assert!(!constant_time_eq("abc", "abd"));
+        assert!(!constant_time_eq("abc", "abcd"));
+    }
+
+    #[test]
+    fn login_usernames_are_bounded_before_limiting() {
+        assert!(normalize_login_username("  alice  ").is_ok());
+        assert!(normalize_login_username(&"a".repeat(MAX_LOGIN_USERNAME_BYTES + 1)).is_err());
+        assert!(normalize_login_username("ali\nce").is_err());
+        assert!(normalize_login_username("   ").is_err());
+
+        let secret = [9u8; 32];
+        let key = login_account_key(&secret, "Alice");
+        assert_eq!(key.len(), 64);
+        assert_eq!(key, login_account_key(&secret, "alice"));
+        assert_ne!(key, login_account_key(&secret, "bob"));
+        assert_ne!(key, login_account_key(&[8u8; 32], "alice"));
+    }
+
+    #[test]
+    fn limiter_reserves_atomically_and_clears_on_success() {
+        let mut limiter = LoginLimiter::default();
+        let key = "account";
+        for attempt in 1..=ACCOUNT_MAX_ATTEMPTS {
+            assert_eq!(
+                limiter.begin_at(1_000, key, "source"),
+                LoginDecision::Reserved,
+                "attempt {attempt} should be reserved"
+            );
+        }
+        assert_eq!(
+            limiter.begin_at(1_000, key, "source"),
+            LoginDecision::Limited,
+            "immediate retries are rejected without hashing"
+        );
+        assert_eq!(
+            limiter.begin_at(1_000 + ACCOUNT_BYPASS_COOLDOWN_SECS, key, "source"),
+            LoginDecision::VerifyDespiteAccountLimit,
+            "after the short cooldown a correct password may still be checked"
+        );
+        assert_eq!(
+            limiter.begin_at(1_000 + ACCOUNT_BYPASS_COOLDOWN_SECS, key, "source"),
+            LoginDecision::Limited,
+            "concurrent bypass attempts cannot all run"
+        );
+        assert_eq!(limiter.account_attempts(key), ACCOUNT_MAX_ATTEMPTS + 1);
+
+        limiter.clear_account(key);
+        assert_eq!(limiter.account_attempts(key), 0);
+        assert_eq!(
+            limiter.begin_at(1_000 + ACCOUNT_BYPASS_COOLDOWN_SECS, key, "source"),
+            LoginDecision::Reserved
+        );
+    }
+
+    #[test]
+    fn limiter_expires_old_attempts() {
+        let mut limiter = LoginLimiter::default();
+        for _ in 0..ACCOUNT_MAX_ATTEMPTS {
+            let _ = limiter.begin_at(1_000, "account", "source");
+        }
+        assert_eq!(
+            limiter.begin_at(1_000 + ACCOUNT_WINDOW_SECS, "account", "source"),
+            LoginDecision::Reserved
+        );
+    }
+
+    #[test]
+    fn limiter_has_source_and_global_budgets() {
+        let mut limiter = LoginLimiter::default();
+        for index in 0..SOURCE_MAX_ATTEMPTS {
+            assert_eq!(
+                limiter.begin_at(1_000, &format!("account-{index}"), "one-source"),
+                LoginDecision::Reserved
+            );
+        }
+        assert_eq!(
+            limiter.begin_at(1_000, "fresh-account", "one-source"),
+            LoginDecision::Limited
+        );
+        // A different source still has budget.
+        assert_eq!(
+            limiter.begin_at(1_000, "fresh-account", "other-source"),
+            LoginDecision::Reserved
+        );
+    }
+
+    #[test]
+    fn limiter_maps_evict_when_capped() {
+        let mut map: HashMap<String, VecDeque<i64>> = HashMap::new();
+        push_attempt(&mut map, "a", 10, 2);
+        push_attempt(&mut map, "b", 20, 2);
+        push_attempt(&mut map, "c", 30, 2);
+        assert_eq!(map.len(), 2);
+        assert!(!map.contains_key("a"));
+        assert!(map.contains_key("b"));
+        assert!(map.contains_key("c"));
+    }
+
+    #[test]
+    fn framing_policy_allows_only_same_origin() {
+        let mut frame = None;
+        let mut csp = None;
+        for &(name, value) in SECURITY_HEADERS {
+            assert!(
+                HeaderName::from_bytes(name.as_bytes()).is_ok(),
+                "invalid security header name {name}"
+            );
+            assert!(
+                HeaderValue::from_bytes(value.as_bytes()).is_ok(),
+                "invalid security header value for {name}"
+            );
+            match name {
+                "x-frame-options" => frame = Some(value),
+                "content-security-policy" => csp = Some(value),
+                _ => {}
+            }
+        }
+
+        assert_eq!(frame, Some("SAMEORIGIN"));
+        let csp = csp.expect("content-security-policy header is missing");
+        assert!(
+            csp.contains("frame-ancestors 'self'"),
+            "same-origin PDF previews must remain frameable"
+        );
+        assert!(!csp.contains("frame-ancestors 'none'"));
+        assert!(!csp.contains("frame-ancestors *"));
+        assert!(csp.contains("default-src 'self'"));
+    }
+
+    #[test]
+    fn backup_scope_is_narrow() {
+        assert!(backup_scope_allows("/api/files"));
+        assert!(backup_scope_allows("/api/files/upload"));
+        assert!(backup_scope_allows("/api/files/abc/content"));
+        assert!(backup_scope_allows("/api/auth/me"));
+        assert!(backup_scope_allows("/api/auth/logout"));
+        assert!(backup_scope_allows("/api/instance"));
+        assert!(!backup_scope_allows("/api/docs/content"));
+        assert!(!backup_scope_allows("/api/search"));
+        assert!(!backup_scope_allows("/api/agent/chat"));
+        assert!(!backup_scope_allows("/api/settings/llm"));
+        assert!(!backup_scope_allows("/api/shares"));
+        assert!(!backup_scope_allows("/api/tokens"));
+        assert!(!backup_scope_allows("/api/filesevil"));
     }
 }

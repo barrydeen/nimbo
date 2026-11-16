@@ -1,0 +1,112 @@
+name: android-release
+
+# A release APK is produced only when every signing secret is present. Without
+# them the workflow explicitly skips the build instead of falling back to a
+# per-environment debug key. See SECURITY.md for the secret names.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    outputs:
+      signing_available: ${{ steps.signing.outputs.available }}
+    steps:
+      - name: Check release signing secrets
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] \
+             && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "Android release signing secrets are configured." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Android release signing secrets are not configured; no release APK will be produced. Add ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS and ANDROID_KEY_PASSWORD."
+            echo "Android release skipped: signing secrets are not configured. No APK was produced and no debug-key fallback was used." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  release:
+    needs: preflight
+    if: needs.preflight.outputs.signing_available == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@0b6dd653ba04f4f93bf581ec31e66cbd7dcb644d # v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
+        with:
+          packages: "platform-tools platforms;android-36 build-tools;36.0.0"
+
+      - name: Unit tests, lint and signed release build
+        working-directory: android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keystore="$RUNNER_TEMP/nimbo-release.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$keystore"
+          chmod 600 "$keystore"
+          ./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleRelease --no-daemon \
+            -Pnimbo.release.storeFile="$keystore" \
+            -Pnimbo.release.storePassword="$KEYSTORE_PASSWORD" \
+            -Pnimbo.release.keyAlias="$KEY_ALIAS" \
+            -Pnimbo.release.keyPassword="$KEY_PASSWORD"
+          rm -f "$keystore"
+
+      - name: Verify signature and tag/version match
+        working-directory: android
+        run: |
+          set -euo pipefail
+          apk="app/build/outputs/apk/release/app-release.apk"
+          test -f "$apk"
+          apksigner="$(find "${ANDROID_HOME}/build-tools" -type f -name apksigner | sort | tail -n 1)"
+          aapt="$(find "${ANDROID_HOME}/build-tools" -type f -name aapt2 | sort | tail -n 1)"
+          "$apksigner" verify --print-certs "$apk"
+          expected="${GITHUB_REF_NAME#v}"
+          actual="$("$aapt" dump badging "$apk" | sed -n "s/^package:.*versionName='\([^']*\)'.*/\1/p")"
+          if [ "$actual" != "$expected" ]; then
+            echo "APK versionName '$actual' does not match tag '$GITHUB_REF_NAME'" >&2
+            exit 1
+          fi
+          sha256sum "$apk" > "$apk.sha256"
+
+      - name: Upload signed release APK
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: nimbo-backup-release-apk
+          path: |
+            android/app/build/outputs/apk/release/app-release.apk
+            android/app/build/outputs/apk/release/app-release.apk.sha256
+          if-no-files-found: error
+          retention-days: 90

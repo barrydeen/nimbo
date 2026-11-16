@@ -21,15 +21,16 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -96,9 +97,11 @@ fun BackupApp(
             !state.configured -> SetupScreen(
                 Modifier.padding(padding),
                 initialUrl = state.serverUrl,
-                initialToken = state.token,
                 initialDeviceName = state.deviceName.ifBlank { defaultDeviceName() },
-                onSave = { url, token, device -> actions.onTestAndSave(url, token, device) },
+                onSave = { url, token, device, insecure, test ->
+                    actions.onTestAndSave(url, token, device, insecure, test)
+                },
+                onScanQr = { actions.onScanQr() },
             )
 
             else -> FolderScreen(Modifier.padding(padding), state, actions)
@@ -107,14 +110,17 @@ fun BackupApp(
 }
 
 class BackupActions(
-    val onTestAndSave: (url: String, token: String, deviceName: String) -> Unit,
+    val onTestAndSave: (url: String, token: String, deviceName: String, allowInsecureHttp: Boolean, testNow: Boolean) -> Unit,
     val onAddFolder: () -> Unit,
     val onToggleFolder: (id: Long, enabled: Boolean) -> Unit,
     val onRemoveFolder: (id: Long) -> Unit,
+    val onRetryFailed: (id: Long) -> Unit,
     val onToggleInstant: (enabled: Boolean) -> Unit,
     val onBackupNow: () -> Unit,
     val onDisconnect: () -> Unit,
+    val onDismissObserverError: () -> Unit,
     val onSnackbarConsumed: () -> Unit,
+    val onScanQr: () -> Unit,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -146,13 +152,20 @@ private fun FolderTopBar(state: UiState, actions: BackupActions) {
 private fun SetupScreen(
     modifier: Modifier = Modifier,
     initialUrl: String,
-    initialToken: String,
     initialDeviceName: String,
-    onSave: (url: String, token: String, deviceName: String) -> Unit,
+    onSave: (url: String, token: String, deviceName: String, allowInsecure: Boolean, testNow: Boolean) -> Unit,
+    onScanQr: () -> Unit,
 ) {
     var url by rememberSaveable { mutableStateOf(initialUrl) }
-    var token by rememberSaveable { mutableStateOf(initialToken) }
+    // Never place the raw token in saved instance state.
+    var token by remember { mutableStateOf("") }
     var deviceName by rememberSaveable { mutableStateOf(initialDeviceName) }
+    var allowInsecure by rememberSaveable { mutableStateOf(false) }
+    var testNow by rememberSaveable { mutableStateOf(false) }
+
+    val httpUrl = url.trim().startsWith("http://", ignoreCase = true)
+    val fieldsReady = url.isNotBlank() && token.isNotBlank()
+    val transportReady = !httpUrl || allowInsecure
 
     Column(
         modifier = modifier
@@ -171,9 +184,25 @@ private fun SetupScreen(
         )
         Text("Connect to your Nimbo server", style = MaterialTheme.typography.titleLarge)
         Text(
-            "Create a device token in Nimbo under Settings → Device tokens, " +
-                "then paste it here. Backups run over Wi-Fi only.",
+            "Scan the pairing QR code shown by Nimbo's settings (Settings → Connect phone), " +
+                "or create a device token and enter it manually. Backups run only on unmetered " +
+                "networks (Wi-Fi/Ethernet); an optional connection test below uses whatever " +
+                "network is currently active.",
             style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
+        Button(
+            onClick = onScanQr,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Icon(Icons.Default.QrCodeScanner, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text("Scan QR code")
+        }
+        Text(
+            "or pair manually",
+            style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
         )
@@ -192,6 +221,7 @@ private fun SetupScreen(
             placeholder = { Text("nmb_…") },
             singleLine = true,
             visualTransformation = PasswordVisualTransformation(),
+            supportingText = { Text("Stored encrypted with an Android Keystore-backed key.") },
             modifier = Modifier.fillMaxWidth(),
         )
         OutlinedTextField(
@@ -202,13 +232,66 @@ private fun SetupScreen(
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
+
+        if (httpUrl) {
+            Text(
+                "Insecure HTTP is disabled by default. It exposes your device token and every " +
+                    "backed-up file to anyone on the network path. Use HTTPS unless you fully " +
+                    "understand this risk.",
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+                textAlign = TextAlign.Center,
+            )
+            CheckRow(
+                checked = allowInsecure,
+                onCheckedChange = { allowInsecure = it },
+                text = "I understand the risk and want to allow insecure HTTP for this server.",
+            )
+        }
+
+        CheckRow(
+            checked = testNow,
+            onCheckedChange = { testNow = it },
+            text = "Send a connection test now over the current network (may use mobile data).",
+        )
+
         Button(
-            onClick = { onSave(url.trim(), token.trim(), deviceName.trim()) },
-            enabled = url.isNotBlank() && token.isNotBlank(),
+            onClick = {
+                onSave(url.trim(), token.trim(), deviceName.trim(), allowInsecure, true)
+            },
+            enabled = fieldsReady && transportReady && testNow,
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text("Test & Save")
         }
+        OutlinedButton(
+            onClick = {
+                onSave(url.trim(), token.trim(), deviceName.trim(), allowInsecure, false)
+            },
+            enabled = fieldsReady && transportReady,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Save without testing")
+        }
+    }
+}
+
+@Composable
+private fun CheckRow(
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    text: String,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Checkbox(checked = checked, onCheckedChange = onCheckedChange)
+        Text(
+            text,
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.weight(1f),
+        )
     }
 }
 
@@ -220,7 +303,12 @@ private fun FolderScreen(
 ) {
     Column(modifier = modifier.fillMaxSize()) {
         if (state.authFailed) {
-            ErrorBanner("Server rejected the device token. Paste a fresh token below.")
+            ErrorBanner(
+                "Server rejected the device token. Re-pair with a fresh token; pending files are kept.",
+            )
+        }
+        state.observerError?.let { message ->
+            ErrorBanner(message, onDismiss = actions.onDismissObserverError)
         }
         Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
             Row(
@@ -230,7 +318,8 @@ private fun FolderScreen(
                 Column(Modifier.weight(1f)) {
                     Text("Real-time backup", style = MaterialTheme.typography.titleMedium)
                     Text(
-                        "Instantly upload photos, videos & downloads (Wi-Fi)",
+                        "Best-effort instant uploads on unmetered networks. Android 15+ may stop " +
+                            "this after a time limit; the 15-minute scan keeps running.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -287,18 +376,32 @@ private fun FolderCard(ui: FolderUi, actions: BackupActions) {
                         if (counts.uploaded > 0) add("${counts.uploaded} backed up")
                         if (counts.pending > 0) add("${counts.pending} pending")
                         if (counts.failed > 0) add("${counts.failed} failed")
+                        if (counts.skipped > 0) add("${counts.skipped} skipped")
                     }
                     if (parts.isNotEmpty()) {
                         Text(
                             parts.joinToString(" · "),
                             style = MaterialTheme.typography.bodySmall,
                             color = when {
-                                counts.failed > 0 -> MaterialTheme.colorScheme.error
+                                counts.failed > 0 || counts.skipped > 0 -> MaterialTheme.colorScheme.error
                                 counts.pending > 0 -> MaterialTheme.colorScheme.secondary
                                 else -> MaterialTheme.colorScheme.onSurfaceVariant
                             },
                         )
                     }
+                    if (counts.failed > 0 || counts.skipped > 0) {
+                        TextButton(onClick = { actions.onRetryFailed(f.id) }) {
+                            Text("Retry failed & skipped")
+                        }
+                    }
+                }
+                ui.lastError?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                        maxLines = 2,
+                    )
                 }
                 f.lastScanAt?.let {
                     Text(
@@ -321,7 +424,7 @@ private fun FolderCard(ui: FolderUi, actions: BackupActions) {
 }
 
 @Composable
-private fun ErrorBanner(text: String) {
+private fun ErrorBanner(text: String, onDismiss: (() -> Unit)? = null) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
@@ -334,7 +437,15 @@ private fun ErrorBanner(text: String) {
             tint = MaterialTheme.colorScheme.error,
         )
         Spacer(Modifier.width(8.dp))
-        Text(text, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+        Text(
+            text,
+            color = MaterialTheme.colorScheme.error,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.weight(1f),
+        )
+        if (onDismiss != null) {
+            TextButton(onClick = onDismiss) { Text("Dismiss") }
+        }
     }
 }
 
@@ -353,8 +464,9 @@ private fun EmptyHint() {
         )
         Spacer(Modifier.height(8.dp))
         Text(
-            "Tap + and pick a folder to back up — camera rolls, WhatsApp media, " +
-                "Downloads, anything. New files upload automatically over Wi-Fi.",
+            "Tap + and pick a folder that Android's file picker allows (for example a camera " +
+                "roll or a media folder). Android blocks internal-storage roots, Download and " +
+                "other apps' Android/data folders from this picker.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,

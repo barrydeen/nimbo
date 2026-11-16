@@ -1,24 +1,77 @@
+# Local / single-host deployment.
+#
+# The default publication is loopback-only. Set NIMBO_PUBLISH_HOST=0.0.0.0
+# only when a firewall and a TLS-terminating proxy are already in place (see
+# docker-compose.production.yml and docs/operations.md). Never expose this
+# plain-HTTP port directly to the Internet.
+name: nimbo
+
 services:
   nimbo:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: nimbo:latest
+      args:
+        VERSION: "${NIMBO_VERSION:-dev}"
+        REVISION: "${NIMBO_REVISION:-local}"
+    image: "${NIMBO_IMAGE:-nimbo:local}"
     container_name: nimbo
+    # Host-side bind address and port. Keeping the default on 127.0.0.1 means
+    # first-run setup cannot be claimed by another machine on the LAN.
     ports:
-      - "8080:8080"
+      - "${NIMBO_PUBLISH_HOST:-127.0.0.1}:${NIMBO_PUBLISH_PORT:-8080}:8080"
     volumes:
+      # Named volume holds the database (including WAL/SHM sidecars), the
+      # instance key, the vault and content-addressed blobs.
       - nimbo_data:/data
+    # Pass optional operator values (notably NIMBO_SETUP_TOKEN) without forcing
+    # an empty string into the process. An empty NIMBO_SETUP_TOKEN is rejected
+    # by strict configuration validation, so the variable must be omitted
+    # rather than set blank.
+    env_file:
+      - path: .env
+        required: false
     environment:
-      # Listen address inside the container.
-      NIMBO_BIND: "${NIMBO_BIND:-0.0.0.0:8080}"
-      # Set to "true" when serving behind HTTPS so the session cookie is Secure.
+      # Inside the container the process must listen on all interfaces for the
+      # published port to reach it. Do not change this to 127.0.0.1 here.
+      NIMBO_BIND: "0.0.0.0:8080"
+      # Set to "true" only when every browser request arrives over HTTPS.
       NIMBO_SECURE_COOKIES: "${NIMBO_SECURE_COOKIES:-false}"
-      # Session lifetime in days.
       NIMBO_SESSION_TTL_DAYS: "${NIMBO_SESSION_TTL_DAYS:-30}"
-      # Maximum size of one uploaded file, in MiB.
+      NIMBO_AUDIT_RETENTION_DAYS: "${NIMBO_AUDIT_RETENTION_DAYS:-90}"
       NIMBO_MAX_UPLOAD_MB: "${NIMBO_MAX_UPLOAD_MB:-200}"
+      RUST_LOG: "${NIMBO_LOG:-nimbo=info,tower_http=info}"
     restart: unless-stopped
+    # Leave time for the graceful HTTP/worker drain before Docker sends SIGKILL.
+    stop_grace_period: 30s
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Compose v2 applies these limits to a normal (non-swarm) container too.
+    # They are a backstop, not a per-parser memory/time guarantee.
+    deploy:
+      resources:
+        limits:
+          cpus: "${NIMBO_CPUS:-2.0}"
+          memory: "${NIMBO_MEMORY:-2g}"
+          pids: 512
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   nimbo_data:
+    name: nimbo_nimbo_data

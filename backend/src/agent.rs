@@ -4,7 +4,27 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::convert::Infallible;
+use std::{convert::Infallible, sync::OnceLock, time::Duration};
+use tokio::sync::Semaphore;
+
+pub const MAX_CHAT_MESSAGE_CHARS: usize = 8_000;
+pub const MAX_CHAT_MESSAGE_BYTES: usize = 32 * 1024;
+pub const MAX_ACTION_TEXT_BYTES: usize = 512 * 1024;
+pub const MAX_PATH_BYTES: usize = 512;
+pub const MAX_CHAT_OUTPUT_TOKENS: u32 = 1_200;
+pub const MAX_ACTION_OUTPUT_TOKENS: u32 = 1_200;
+pub const MAX_LINK_PATHS: usize = 200;
+
+const MAX_FTS_TERMS: usize = 16;
+const MAX_CONTEXT_BYTES: usize = 24_000;
+const MAX_PROVIDER_ERROR_BYTES: usize = 8 * 1024;
+const MAX_PROVIDER_JSON_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
+const LLM_CONCURRENCY: usize = 4;
+const PROVIDER_TIMEOUT: Duration = Duration::from_secs(180);
+
+static LLM_SEMAPHORE: Semaphore = Semaphore::const_new(LLM_CONCURRENCY);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LlmConfig {
@@ -34,6 +54,19 @@ pub fn default_base_url() -> String {
     "https://api.openai.com/v1".to_string()
 }
 
+/// Reused HTTP client; building a fresh client per call wastes connection pools
+/// and TLS setup. Redirects are not followed for provider calls.
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(PROVIDER_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::limited(2))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
 pub async fn load_config(state: &AppState) -> Result<Option<LlmConfig>, ApiError> {
     let Some(stored) = db::get_setting(&state.pool, "llm_config").await? else {
         return Ok(None);
@@ -58,11 +91,47 @@ fn endpoint(base_url: &str) -> String {
     format!("{}/chat/completions", base_url.trim_end_matches('/'))
 }
 
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
-        .build()
-        .expect("http client")
+/// Normalized origin (`scheme://host[:port]`) used to decide whether a stored
+/// provider secret may be reused. Paths/queries are intentionally ignored.
+pub fn url_origin(base_url: &str) -> Option<String> {
+    let trimmed = base_url.trim();
+    let (scheme, rest) = trimmed.split_once("://")?;
+    if scheme.is_empty() {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}://{}",
+        scheme.to_ascii_lowercase(),
+        authority.to_ascii_lowercase()
+    ))
+}
+
+fn with_auth(builder: reqwest::RequestBuilder, cfg: &LlmConfig) -> reqwest::RequestBuilder {
+    let key = cfg.api_key.trim();
+    if key.is_empty() {
+        builder
+    } else {
+        builder.bearer_auth(key)
+    }
+}
+
+/// Reads at most `max` bytes from a provider body. Unlike `.text()`/`.json()`
+/// this bounds allocation even when the provider lies about or omits length.
+async fn read_limited(response: reqwest::Response, max: usize) -> Result<Vec<u8>, String> {
+    let mut stream = response.bytes_stream();
+    let mut out = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| format!("stream error: {err}"))?;
+        if out.len().saturating_add(chunk.len()) > max {
+            return Err(format!("provider body exceeds {max} bytes"));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 /// Reads the current document and a handful of search-relevant documents to
@@ -76,12 +145,15 @@ pub async fn gather_context(
 
     if let Some(path) = path {
         let rel = docs::normalize_path(path)?;
-        if let Ok(content) = std::fs::read_to_string(state.cfg.vault_dir().join(&rel)) {
-            context.push_str(&format!("## {rel}\n{}\n\n", truncate(&content, 6000)));
+        if let Ok(content) = docs::read_document(state, &rel) {
+            push_context(
+                &mut context,
+                format!("## {rel}\n{}\n\n", truncate(&content, 6_000)),
+            );
         }
     }
 
-    let fts_query = docs::build_fts_query(query);
+    let fts_query = bounded_fts_query(query);
     if !fts_query.is_empty() {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT path FROM docs_fts WHERE docs_fts MATCH ? \
@@ -95,11 +167,11 @@ pub async fn gather_context(
             if Some(rel.as_str()) == path {
                 continue;
             }
-            if let Ok(content) = std::fs::read_to_string(state.cfg.vault_dir().join(&rel)) {
-                if context.len() > 16_000 {
-                    break;
-                }
-                context.push_str(&format!("## {rel}\n{}\n\n", truncate(&content, 4000)));
+            if let Ok(content) = docs::read_document(state, &rel) {
+                push_context(
+                    &mut context,
+                    format!("## {rel}\n{}\n\n", truncate(&content, 4_000)),
+                );
             }
         }
 
@@ -114,10 +186,10 @@ pub async fn gather_context(
         .fetch_all(&state.pool)
         .await?;
 
-        if !file_rows.is_empty() && context.len() <= 20_000 {
-            context.push_str("## Files in the drive\n");
+        if !file_rows.is_empty() {
+            let mut block = String::from("## Files in the drive\n");
             for (name, mime, summary) in file_rows {
-                context.push_str(&format!(
+                block.push_str(&format!(
                     "- {name} ({mime}){}\n",
                     if summary.trim().is_empty() {
                         String::new()
@@ -126,11 +198,42 @@ pub async fn gather_context(
                     }
                 ));
             }
-            context.push('\n');
+            block.push('\n');
+            push_context(&mut context, block);
         }
     }
 
     Ok(context)
+}
+
+/// The prompt is natural language, not an FTS program: cap the term count so a
+/// long message cannot become an expensive query or a huge provider request.
+fn bounded_fts_query(query: &str) -> String {
+    let joined = query
+        .split_whitespace()
+        .take(MAX_FTS_TERMS)
+        .collect::<Vec<_>>()
+        .join(" ");
+    docs::build_fts_query(&joined)
+}
+
+fn push_context(context: &mut String, block: String) {
+    if context.len() >= MAX_CONTEXT_BYTES {
+        return;
+    }
+    let remaining = MAX_CONTEXT_BYTES - context.len();
+    context.push_str(truncate_bytes(&block, remaining));
+}
+
+fn truncate_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -154,21 +257,92 @@ pub struct ChatRequest {
     pub path: Option<String>,
 }
 
+/// Incremental SSE line decoder. Bytes are buffered until a newline so a
+/// multibyte code point split across transport chunks is not corrupted, and
+/// both total bytes and single-line length are hard-bounded.
+#[derive(Debug, Default)]
+pub struct SseBuffer {
+    bytes: Vec<u8>,
+    total: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SseError {
+    TooLarge,
+    LineTooLong,
+    InvalidUtf8,
+    Incomplete,
+}
+
+impl std::fmt::Display for SseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge => write!(f, "provider stream exceeds {MAX_SSE_BYTES} bytes"),
+            Self::LineTooLong => {
+                write!(f, "provider stream line exceeds {MAX_SSE_LINE_BYTES} bytes")
+            }
+            Self::InvalidUtf8 => write!(f, "provider stream contained invalid UTF-8"),
+            Self::Incomplete => write!(f, "provider stream ended mid-frame"),
+        }
+    }
+}
+
+impl SseBuffer {
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, SseError> {
+        if self.total.saturating_add(chunk.len()) > MAX_SSE_BYTES {
+            return Err(SseError::TooLarge);
+        }
+        self.total += chunk.len();
+        self.bytes.extend_from_slice(chunk);
+
+        let mut lines = Vec::new();
+        while let Some(position) = self.bytes.iter().position(|byte| *byte == b'\n') {
+            if position > MAX_SSE_LINE_BYTES {
+                return Err(SseError::LineTooLong);
+            }
+            let drained: Vec<u8> = self.bytes.drain(..=position).collect();
+            let line_bytes = &drained[..position];
+            let line = std::str::from_utf8(line_bytes).map_err(|_| SseError::InvalidUtf8)?;
+            lines.push(line.trim_end_matches('\r').to_string());
+        }
+        if self.bytes.len() > MAX_SSE_LINE_BYTES {
+            return Err(SseError::LineTooLong);
+        }
+        Ok(lines)
+    }
+
+    pub fn finish(&self) -> Result<(), SseError> {
+        if self.bytes.is_empty() {
+            Ok(())
+        } else {
+            Err(SseError::Incomplete)
+        }
+    }
+}
+
 pub fn chat_stream(
     cfg: LlmConfig,
     messages: Vec<Value>,
 ) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
+        let permit = match LLM_SEMAPHORE.acquire().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                yield Ok(Event::default().event("error").data("provider concurrency limit unavailable"));
+                return;
+            }
+        };
+        let _permit = permit;
+
         let payload = json!({
             "model": cfg.model,
             "messages": messages,
             "temperature": cfg.temperature,
+            "max_tokens": MAX_CHAT_OUTPUT_TOKENS,
             "stream": true,
         });
 
-        let response = match client()
-            .post(endpoint(&cfg.base_url))
-            .bearer_auth(&cfg.api_key)
+        let response = match with_auth(http_client().post(endpoint(&cfg.base_url)), &cfg)
             .json(&payload)
             .send()
             .await
@@ -182,7 +356,10 @@ pub fn chat_stream(
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = read_limited(response, MAX_PROVIDER_ERROR_BYTES)
+                .await
+                .unwrap_or_default();
+            let body = String::from_utf8_lossy(&body);
             yield Ok(Event::default()
                 .event("error")
                 .data(format!("provider error {status}: {}", truncate(&body, 300))));
@@ -190,45 +367,69 @@ pub fn chat_stream(
         }
 
         let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        let mut buffer = SseBuffer::default();
 
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(err) => {
                     yield Ok(Event::default().event("error").data(format!("stream error: {err}")));
-                    break;
+                    return;
                 }
             };
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            let lines = match buffer.push(&chunk) {
+                Ok(lines) => lines,
+                Err(err) => {
+                    yield Ok(Event::default().event("error").data(err.to_string()));
+                    return;
+                }
+            };
 
-            while let Some(pos) = buffer.find('\n') {
-                let line: String = buffer.drain(..=pos).collect();
+            for line in lines {
                 let line = line.trim();
-                if let Some(data) = line.strip_prefix("data:") {
-                    let data = data.trim();
-                    if data == "[DONE]" {
-                        yield Ok(Event::default().event("done").data(""));
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data.is_empty() {
+                    continue;
+                }
+                if data == "[DONE]" {
+                    yield Ok(Event::default().event("done").data(""));
+                    return;
+                }
+                let value = match serde_json::from_str::<Value>(data) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        yield Ok(Event::default()
+                            .event("error")
+                            .data("provider sent malformed stream data"));
                         return;
                     }
-                    if let Ok(value) = serde_json::from_str::<Value>(data) {
-                        if let Some(text) = value
-                            .get("choices")
-                            .and_then(|c| c.get(0))
-                            .and_then(|c| c.get("delta"))
-                            .and_then(|d| d.get("content"))
-                            .and_then(|c| c.as_str())
-                        {
-                            if !text.is_empty() {
-                                yield Ok(Event::default().data(text));
-                            }
-                        }
+                };
+                if let Some(text) = value
+                    .get("choices")
+                    .and_then(|choices| choices.get(0))
+                    .and_then(|choice| choice.get("delta"))
+                    .and_then(|delta| delta.get("content"))
+                    .and_then(|content| content.as_str())
+                {
+                    if !text.is_empty() {
+                        yield Ok(Event::default().data(text));
                     }
                 }
             }
         }
 
-        yield Ok(Event::default().event("done").data(""));
+        if let Err(err) = buffer.finish() {
+            yield Ok(Event::default().event("error").data(err.to_string()));
+            return;
+        }
+        // A provider that closes the stream without [DONE] gave us an incomplete
+        // answer; reporting `done` would falsely mark it successful.
+        yield Ok(Event::default()
+            .event("error")
+            .data("provider stream ended before completion"));
     }
 }
 
@@ -239,6 +440,10 @@ pub async fn complete(
     user: &str,
     max_tokens: u32,
 ) -> Result<String, ApiError> {
+    let _permit = LLM_SEMAPHORE
+        .acquire()
+        .await
+        .map_err(|_| ApiError::service_unavailable("provider concurrency limit unavailable"))?;
     let payload = json!({
         "model": cfg.model,
         "messages": [
@@ -246,12 +451,10 @@ pub async fn complete(
             { "role": "user", "content": user },
         ],
         "temperature": cfg.temperature,
-        "max_tokens": max_tokens,
+        "max_tokens": max_tokens.clamp(1, MAX_ACTION_OUTPUT_TOKENS),
     });
 
-    let response = client()
-        .post(endpoint(&cfg.base_url))
-        .bearer_auth(&cfg.api_key)
+    let response = with_auth(http_client().post(endpoint(&cfg.base_url)), cfg)
         .json(&payload)
         .send()
         .await
@@ -259,24 +462,28 @@ pub async fn complete(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = read_limited(response, MAX_PROVIDER_ERROR_BYTES)
+            .await
+            .unwrap_or_default();
+        let body = String::from_utf8_lossy(&body);
         return Err(ApiError::bad_request(format!(
             "provider error {status}: {}",
             truncate(&body, 300)
         )));
     }
 
-    let value: Value = response
-        .json()
+    let body = read_limited(response, MAX_PROVIDER_JSON_BYTES)
         .await
+        .map_err(|err| ApiError::bad_request(format!("invalid provider response: {err}")))?;
+    let value: Value = serde_json::from_slice(&body)
         .map_err(|err| ApiError::bad_request(format!("invalid provider response: {err}")))?;
 
     value
         .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_str())
         .map(str::to_string)
         .ok_or_else(|| ApiError::bad_request("provider returned no content"))
 }
@@ -306,6 +513,10 @@ pub async fn describe_image(
     jpeg: &[u8],
     filename: &str,
 ) -> Result<VisionDescription, ApiError> {
+    let _permit = LLM_SEMAPHORE
+        .acquire()
+        .await
+        .map_err(|_| ApiError::service_unavailable("provider concurrency limit unavailable"))?;
     let model = cfg
         .vision_model
         .as_deref()
@@ -334,9 +545,7 @@ pub async fn describe_image(
         "max_tokens": 900
     });
 
-    let response = client()
-        .post(endpoint(&cfg.base_url))
-        .bearer_auth(&cfg.api_key)
+    let response = with_auth(http_client().post(endpoint(&cfg.base_url)), cfg)
         .json(&payload)
         .send()
         .await
@@ -344,23 +553,27 @@ pub async fn describe_image(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = read_limited(response, MAX_PROVIDER_ERROR_BYTES)
+            .await
+            .unwrap_or_default();
+        let body = String::from_utf8_lossy(&body);
         return Err(ApiError::bad_request(format!(
             "vision provider error {status}: {}. Choose a vision-capable model in Settings.",
             truncate(&body, 300)
         )));
     }
 
-    let value: Value = response
-        .json()
+    let body = read_limited(response, MAX_PROVIDER_JSON_BYTES)
         .await
+        .map_err(|err| ApiError::bad_request(format!("invalid vision response: {err}")))?;
+    let value: Value = serde_json::from_slice(&body)
         .map_err(|err| ApiError::bad_request(format!("invalid vision response: {err}")))?;
     let content = value
         .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_str())
         .ok_or_else(|| ApiError::bad_request("vision provider returned no content"))?;
 
     let mut described = parse_vision_reply(content);
@@ -434,5 +647,64 @@ mod tests {
         let reply = parse_vision_reply("Just a plain description of a cat.");
         assert_eq!(reply.description, "Just a plain description of a cat.");
         assert!(reply.tags.is_empty());
+    }
+
+    #[test]
+    fn origins_are_normalized_for_secret_reuse() {
+        assert_eq!(
+            url_origin("https://API.Example.com:443/v1/").as_deref(),
+            Some("https://api.example.com:443")
+        );
+        assert_eq!(
+            url_origin("http://localhost:11434/v1").as_deref(),
+            Some("http://localhost:11434")
+        );
+        assert_ne!(
+            url_origin("https://api.example.com/v1"),
+            url_origin("https://evil.example.com/v1")
+        );
+        assert!(url_origin("not a url").is_none());
+    }
+
+    #[test]
+    fn sse_buffer_preserves_split_utf8() {
+        let line = "data: h\u{e9}llo \u{1f600}\n";
+        let bytes = line.as_bytes();
+        let split = 7; // inside the two-byte é sequence
+        let mut buffer = SseBuffer::default();
+        assert!(buffer.push(&bytes[..split]).unwrap().is_empty());
+        let lines = buffer.push(&bytes[split..]).unwrap();
+        assert_eq!(lines, vec!["data: h\u{e9}llo \u{1f600}"]);
+        assert!(buffer.finish().is_ok());
+    }
+
+    #[test]
+    fn sse_buffer_bounds_lines_and_incomplete_frames() {
+        let mut buffer = SseBuffer::default();
+        let oversized = vec![b'a'; MAX_SSE_LINE_BYTES + 1];
+        assert_eq!(buffer.push(&oversized), Err(SseError::LineTooLong));
+
+        let mut buffer = SseBuffer::default();
+        buffer.push(b"data: {").unwrap();
+        assert_eq!(buffer.finish(), Err(SseError::Incomplete));
+    }
+
+    #[test]
+    fn context_truncation_respects_char_boundaries() {
+        assert_eq!(truncate_bytes("abc", 10), "abc");
+        assert_eq!(truncate_bytes("h\u{e9}llo", 2), "h");
+        assert_eq!(truncate_bytes("h\u{e9}llo", 3), "h\u{e9}");
+    }
+
+    #[test]
+    fn fts_query_terms_are_capped() {
+        let query = (0..100)
+            .map(|index| format!("term{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let bounded = bounded_fts_query(&query);
+        assert!(bounded.contains("term0"));
+        assert!(bounded.contains("term15"));
+        assert!(!bounded.contains("term16"));
     }
 }

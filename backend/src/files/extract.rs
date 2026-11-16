@@ -4,15 +4,21 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TEXT_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_METADATA_JSON: usize = 64 * 1024;
+const MAX_METADATA_STRING: usize = 512;
 const MAX_IMAGE_PIXELS: u64 = 80_000_000;
+const MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_PDF_BYTES: u64 = 60 * 1024 * 1024;
+const MAX_ARCHIVE_INPUT_BYTES: u64 = 96 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 500;
+const MAX_ARCHIVE_CD_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ARCHIVE_TOTAL: u64 = 64 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRY: u64 = 8 * 1024 * 1024;
 const MAX_EXIF_FIELDS: usize = 80;
+const MAX_XML_EVENTS: usize = 1_000_000;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Extraction {
     pub metadata: Map<String, Value>,
     pub text: Option<String>,
@@ -22,17 +28,99 @@ pub struct Extraction {
 }
 
 impl Extraction {
+    /// Serializes extracted metadata. Oversized metadata is pruned structurally
+    /// (bounded strings, arrays, objects and top-level keys) so the result is
+    /// always valid JSON and never cut inside a UTF-8 character.
     pub fn metadata_json(&self) -> String {
-        let value = Value::Object(self.metadata.clone());
-        let mut encoded = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
-        if encoded.len() > MAX_METADATA_JSON {
-            encoded.truncate(MAX_METADATA_JSON);
-            if let Some(cut) = encoded.rfind('"') {
-                encoded.truncate(cut + 1);
+        prune_metadata(&self.metadata)
+    }
+}
+
+fn take_bytes(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut cut = max;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &text[..cut]
+}
+
+fn shrink_value(value: &mut Value, depth: usize) {
+    match value {
+        Value::String(text) => {
+            if text.len() > MAX_METADATA_STRING {
+                let cut = take_bytes(text, MAX_METADATA_STRING).len();
+                text.truncate(cut);
             }
-            encoded.push_str(",\"_truncated\":true}");
         }
-        encoded
+        Value::Array(items) => {
+            items.truncate(32);
+            for item in items.iter_mut() {
+                shrink_value(item, depth + 1);
+            }
+        }
+        Value::Object(map) => {
+            if depth > 6 {
+                map.clear();
+                return;
+            }
+            if map.len() > 32 {
+                let mut keys: Vec<String> = map.keys().cloned().collect();
+                keys.sort();
+                keys.truncate(32);
+                map.retain(|key, _| keys.contains(key));
+            }
+            for item in map.values_mut() {
+                shrink_value(item, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn prune_metadata(map: &Map<String, Value>) -> String {
+    const MARKER: &str = ",\"_truncated\":true}";
+    let mut value = Value::Object(map.clone());
+    shrink_value(&mut value, 0);
+    let mut truncated = false;
+    loop {
+        let Ok(encoded) = serde_json::to_string(&value) else {
+            return "{}".to_string();
+        };
+        if !truncated && encoded.len() <= MAX_METADATA_JSON {
+            return encoded;
+        }
+        if truncated && encoded.len() + MARKER.len() <= MAX_METADATA_JSON {
+            return format!("{}{}", &encoded[..encoded.len() - 1], MARKER);
+        }
+        let Some(object) = value.as_object_mut() else {
+            return "{\"_truncated\":true}".to_string();
+        };
+        // Drop the largest remaining top-level field first.
+        let largest = object
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    serde_json::to_vec(value)
+                        .map(|bytes| bytes.len())
+                        .unwrap_or(0),
+                )
+            })
+            .max_by_key(|(_, size)| *size)
+            .map(|(key, _)| key);
+        match largest {
+            Some(key) if !object.is_empty() => {
+                object.remove(&key);
+                truncated = true;
+            }
+            _ => return "{\"_truncated\":true}".to_string(),
+        }
+        if object.is_empty() {
+            return "{\"_truncated\":true}".to_string();
+        }
     }
 }
 
@@ -111,6 +199,15 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     } else {
         text.chars().take(max_chars).collect()
     }
+}
+
+/// Appends only up to `budget` bytes so repeated archive entries cannot grow the
+/// extracted text without bound.
+fn push_text(text: &mut String, extra: &str, budget: usize) {
+    if text.len() >= budget {
+        return;
+    }
+    text.push_str(take_bytes(extra, budget - text.len()));
 }
 
 fn decode_text(bytes: &[u8]) -> (String, &'static str) {
@@ -234,10 +331,18 @@ fn image_metadata(bytes: &[u8]) -> (Map<String, Value>, Option<Vec<u8>>, Option<
         );
     }
 
-    let decoded = image::ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(image::ImageError::IoError)
-        .and_then(|reader| reader.decode());
+    let decoded = {
+        let mut reader = match image::ImageReader::new(Cursor::new(bytes)).with_guessed_format() {
+            Ok(reader) => reader,
+            Err(err) => return (info, None, Some(err.to_string()), true),
+        };
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(20_000);
+        limits.max_image_height = Some(20_000);
+        limits.max_alloc = Some(256 * 1024 * 1024);
+        reader.limits(limits);
+        reader.decode()
+    };
     match decoded {
         Ok(mut image) => {
             if let Some(orientation) = image::metadata::Orientation::from_exif(orientation) {
@@ -278,6 +383,15 @@ fn pdf_metadata(bytes: &[u8]) -> (Map<String, Value>, Option<String>, bool) {
     let mut info = Map::new();
     let mut text = None;
     let mut partial = false;
+
+    // Gate before the first (lopdf) parser, not only before pdf_extract.
+    if bytes.len() as u64 > MAX_PDF_BYTES {
+        info.insert(
+            "text_skipped".into(),
+            json!("file is too large for PDF parsing"),
+        );
+        return (info, None, true);
+    }
 
     let doc = match lopdf::Document::load_mem(bytes) {
         Ok(doc) => doc,
@@ -346,6 +460,43 @@ fn pdf_metadata(bytes: &[u8]) -> (Map<String, Value>, Option<String>, bool) {
     (info, text, partial)
 }
 
+/// Reads the declared entry count and central-directory size from the ZIP
+/// end-of-central-directory record without materialising the archive. This lets
+/// the extractor reject pathological archives before `ZipArchive::new` builds
+/// the central directory.
+fn zip_declared_entries(bytes: &[u8]) -> Option<(usize, u64)> {
+    const EOCD: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
+    if bytes.len() < 22 {
+        return None;
+    }
+    let window_start = bytes.len().saturating_sub(65_557);
+    let mut index = bytes.len() - 4;
+    let eocd = loop {
+        if bytes[index..index + 4] == EOCD {
+            break index;
+        }
+        if index == window_start {
+            return None;
+        }
+        index -= 1;
+    };
+    if eocd + 22 > bytes.len() {
+        return None;
+    }
+    let count = u16::from_le_bytes([bytes[eocd + 10], bytes[eocd + 11]]) as usize;
+    let cd_size = u32::from_le_bytes([
+        bytes[eocd + 12],
+        bytes[eocd + 13],
+        bytes[eocd + 14],
+        bytes[eocd + 15],
+    ]) as u64;
+    // ZIP64 sentinels mean "look elsewhere"; treat as oversized for our caps.
+    if count == usize::from(u16::MAX) || cd_size == u64::from(u32::MAX) {
+        return Some((usize::MAX, cd_size));
+    }
+    Some((count, cd_size))
+}
+
 fn read_zip_entry(
     archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
     name: &str,
@@ -383,8 +534,14 @@ fn xml_metadata(
     let mut value = String::new();
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
+    let text_budget = MAX_TEXT_BYTES * 2;
+    let mut events = 0usize;
 
     loop {
+        events += 1;
+        if events > MAX_XML_EVENTS {
+            break;
+        }
         match reader.read_event() {
             Ok(Event::Start(event)) => {
                 current = local_name(event.local_name().as_ref());
@@ -406,12 +563,15 @@ fn xml_metadata(
             Ok(Event::Text(event)) => {
                 let content = event.xml_content(quick_xml::XmlVersion::Explicit1_0);
                 if !content.is_empty() {
-                    if text_tags.is_empty() || text_tags.contains(&current.as_str()) {
-                        value.push_str(&content);
-                    }
-                    if text_tags.is_empty() || text_tags.contains(&current.as_str()) {
-                        text.push_str(&content);
-                        text.push(' ');
+                    let wanted = text_tags.is_empty() || text_tags.contains(&current.as_str());
+                    if wanted {
+                        if value.len() < 100_000 {
+                            value.push_str(&content);
+                        }
+                        if text.len() < text_budget {
+                            text.push_str(&content);
+                            text.push(' ');
+                        }
                     }
                 }
             }
@@ -428,8 +588,12 @@ fn xml_metadata(
                 if !decoded.is_empty()
                     && (text_tags.is_empty() || text_tags.contains(&current.as_str()))
                 {
-                    value.push_str(decoded);
-                    text.push_str(decoded);
+                    if value.len() < 100_000 {
+                        value.push_str(decoded);
+                    }
+                    if text.len() < text_budget {
+                        text.push_str(decoded);
+                    }
                 }
             }
             Ok(Event::End(event)) => {
@@ -437,7 +601,7 @@ fn xml_metadata(
                 if wanted_fields.contains(&name.as_str()) && !value.trim().is_empty() {
                     fields.insert(name.clone(), json!(truncate_chars(value.trim(), 2000)));
                 }
-                if paragraph_tags.contains(&name.as_str()) {
+                if paragraph_tags.contains(&name.as_str()) && text.len() < text_budget {
                     text.push('\n');
                 }
                 value.clear();
@@ -456,6 +620,16 @@ fn archive_text(extension: &str, bytes: &[u8]) -> (Map<String, Value>, Option<St
     let mut info = Map::new();
     let mut text = String::new();
     let mut partial = false;
+    match zip_declared_entries(bytes) {
+        Some((count, cd_size)) if count > MAX_ARCHIVE_ENTRIES || cd_size > MAX_ARCHIVE_CD_BYTES => {
+            if count != usize::MAX {
+                info.insert("entries".into(), json!(count));
+            }
+            info.insert("entry_limit".into(), json!(true));
+            return (info, None, true);
+        }
+        _ => {}
+    }
     let mut archive = match zip::ZipArchive::new(Cursor::new(bytes)) {
         Ok(archive) => archive,
         Err(err) => {
@@ -560,7 +734,7 @@ fn archive_text(extension: &str, bytes: &[u8]) -> (Map<String, Value>, Option<St
                     &["t"],
                     &["p", "tr"],
                 );
-                text.push_str(&extracted);
+                push_text(&mut text, &extracted, MAX_TEXT_BYTES * 2);
             }
         }
         "pptx" => {
@@ -574,8 +748,8 @@ fn archive_text(extension: &str, bytes: &[u8]) -> (Map<String, Value>, Option<St
                 if let Some(slide) = read_zip_entry(&mut archive, &slide, &mut budget) {
                     let (_, extracted) =
                         xml_metadata(&String::from_utf8_lossy(&slide), &[], &["t"], &["p"]);
-                    text.push_str(&extracted);
-                    text.push('\n');
+                    push_text(&mut text, &extracted, MAX_TEXT_BYTES * 2);
+                    push_text(&mut text, "\n", MAX_TEXT_BYTES * 2);
                 }
             }
         }
@@ -584,7 +758,7 @@ fn archive_text(extension: &str, bytes: &[u8]) -> (Map<String, Value>, Option<St
             {
                 let (_, extracted) =
                     xml_metadata(&String::from_utf8_lossy(&strings), &[], &["t"], &[]);
-                text.push_str(&extracted);
+                push_text(&mut text, &extracted, MAX_TEXT_BYTES * 2);
             }
             if let Some(workbook) = read_zip_entry(&mut archive, "xl/workbook.xml", &mut budget) {
                 let (_, extracted) =
@@ -600,7 +774,7 @@ fn archive_text(extension: &str, bytes: &[u8]) -> (Map<String, Value>, Option<St
                     &[],
                     &["p", "h", "table-row"],
                 );
-                text.push_str(&extracted);
+                push_text(&mut text, &extracted, MAX_TEXT_BYTES * 2);
             }
         }
         "epub" => {
@@ -610,8 +784,9 @@ fn archive_text(extension: &str, bytes: &[u8]) -> (Map<String, Value>, Option<St
                 {
                     if let Some(page) = read_zip_entry(&mut archive, &name, &mut budget) {
                         let html = String::from_utf8_lossy(&page);
-                        text.push_str(&strip_html(&html));
-                        text.push('\n');
+                        let stripped = strip_html(&html);
+                        push_text(&mut text, &stripped, MAX_TEXT_BYTES * 2);
+                        push_text(&mut text, "\n", MAX_TEXT_BYTES * 2);
                     }
                 }
             }
@@ -696,20 +871,22 @@ fn audio_metadata(path: &Path) -> (Map<String, Value>, Option<String>) {
     (info, None)
 }
 
+fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(limit).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// Runs all extraction for a file. CPU-heavy and blocking; callers must use
 /// `spawn_blocking` (the worker does).
+///
+/// Each parser is gated *before* the blob is read so an oversized or unsupported
+/// input never forces a whole-file allocation on the sole indexing worker.
 pub fn extract(path: &Path, name: &str, mime: &str) -> Extraction {
     let mut extraction = Extraction::default();
     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            extraction.error = Some(err.to_string());
-            extraction.partial = true;
-            return extraction;
-        }
-    };
-    let head = &bytes[..bytes.len().min(8192)];
 
     extraction.metadata.insert("mime".into(), json!(mime));
     extraction.metadata.insert("size".into(), json!(size));
@@ -722,8 +899,35 @@ pub fn extract(path: &Path, name: &str, mime: &str) -> Extraction {
     }
 
     let extension = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let office = matches!(
+        mime,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            | "application/vnd.oasis.opendocument.text"
+            | "application/vnd.oasis.opendocument.spreadsheet"
+            | "application/vnd.oasis.opendocument.presentation"
+            | "application/epub+zip"
+    );
+
+    let read = |limit: u64, extraction: &mut Extraction| match read_bounded(path, limit) {
+        Ok(bytes) => Some(bytes),
+        Err(err) => {
+            extraction.error = Some(err.to_string());
+            extraction.partial = true;
+            None
+        }
+    };
 
     if is_image(mime) && mime != "image/svg+xml" {
+        if size > MAX_IMAGE_BYTES {
+            extraction.error = Some("image is too large to inspect".into());
+            extraction.partial = true;
+            return extraction;
+        }
+        let Some(bytes) = read(size.max(1), &mut extraction) else {
+            return extraction;
+        };
         let (image_info, thumbnail, warning, partial) = image_metadata(&bytes);
         if !image_info.is_empty() {
             extraction
@@ -736,6 +940,14 @@ pub fn extract(path: &Path, name: &str, mime: &str) -> Extraction {
         }
         extraction.partial |= partial;
     } else if mime == "application/pdf" {
+        if size > MAX_PDF_BYTES {
+            extraction.error = Some("PDF is too large to parse".into());
+            extraction.partial = true;
+            return extraction;
+        }
+        let Some(bytes) = read(size.max(1), &mut extraction) else {
+            return extraction;
+        };
         let (pdf_info, text, partial) = pdf_metadata(&bytes);
         if !pdf_info.is_empty() {
             extraction
@@ -744,16 +956,15 @@ pub fn extract(path: &Path, name: &str, mime: &str) -> Extraction {
         }
         extraction.text = text;
         extraction.partial |= partial;
-    } else if matches!(
-        mime,
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-            | "application/vnd.oasis.opendocument.text"
-            | "application/vnd.oasis.opendocument.spreadsheet"
-            | "application/vnd.oasis.opendocument.presentation"
-            | "application/epub+zip"
-    ) {
+    } else if office {
+        if size > MAX_ARCHIVE_INPUT_BYTES {
+            extraction.error = Some("archive is too large to parse".into());
+            extraction.partial = true;
+            return extraction;
+        }
+        let Some(bytes) = read(size.max(1), &mut extraction) else {
+            return extraction;
+        };
         let (office_info, text, partial) = archive_text(&extension, &bytes);
         if !office_info.is_empty() {
             extraction
@@ -773,6 +984,11 @@ pub fn extract(path: &Path, name: &str, mime: &str) -> Extraction {
             extraction.error = Some(warning);
         }
     } else if is_texty(name, mime) {
+        // Read only a bounded prefix; text is never decoded at unbounded size.
+        let Some(bytes) = read(MAX_TEXT_SOURCE_BYTES + 1, &mut extraction) else {
+            return extraction;
+        };
+        let head = &bytes[..bytes.len().min(8192)];
         // content_inspector helps reject text-looking extensions on binary data.
         let is_binary = content_inspector::inspect(head) == content_inspector::ContentType::BINARY;
         if !is_binary {
@@ -790,9 +1006,10 @@ pub fn extract(path: &Path, name: &str, mime: &str) -> Extraction {
                     "encoding": encoding,
                     "lines": line_count,
                     "words": word_count,
+                    "truncated": size > MAX_TEXT_SOURCE_BYTES,
                 }),
             );
-            extraction.text = Some(truncate_chars(&decoded, MAX_TEXT_BYTES));
+            extraction.text = Some(take_bytes(&decoded, MAX_TEXT_BYTES).to_string());
         } else {
             extraction
                 .metadata
@@ -830,5 +1047,71 @@ mod tests {
         let (_, text) = xml_metadata(xml, &[], &["t"], &["p"]);
         assert!(text.contains("Hello"));
         assert!(text.contains("world"));
+    }
+
+    #[test]
+    fn metadata_pruning_never_breaks_json_or_utf8() {
+        let mut extraction = Extraction::default();
+        extraction.metadata.insert(
+            "huge".into(),
+            json!({"text": "é".repeat(200_000), "list": vec![json!("ü".repeat(1000)); 100]}),
+        );
+        for index in 0..200 {
+            extraction
+                .metadata
+                .insert(format!("field{index:03}"), json!("x".repeat(2000)));
+        }
+        let encoded = extraction.metadata_json();
+        assert!(encoded.len() <= MAX_METADATA_JSON);
+        let parsed: Value = serde_json::from_str(&encoded).expect("valid json");
+        assert!(parsed.is_object());
+        assert!(std::str::from_utf8(encoded.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn metadata_pruning_keeps_small_payloads_intact() {
+        let mut extraction = Extraction::default();
+        extraction.metadata.insert("title".into(), json!("Report"));
+        assert_eq!(extraction.metadata_json(), r#"{"title":"Report"}"#);
+    }
+
+    #[test]
+    fn zip_eocd_entry_count_is_read_before_parsing() {
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buffer);
+            let options = zip::write::SimpleFileOptions::default();
+            for index in 0..3 {
+                use std::io::Write;
+                writer
+                    .start_file(format!("file{index}.txt"), options)
+                    .unwrap();
+                writer.write_all(b"hello").unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let bytes = buffer.into_inner();
+        let (count, _) = zip_declared_entries(&bytes).expect("eocd");
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn archive_entry_gate_rejects_many_entries() {
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buffer);
+            let options = zip::write::SimpleFileOptions::default();
+            for index in 0..(MAX_ARCHIVE_ENTRIES + 5) {
+                writer
+                    .start_file(format!("file{index}.txt"), options)
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let bytes = buffer.into_inner();
+        let (info, text, partial) = archive_text("docx", &bytes);
+        assert!(text.is_none());
+        assert!(partial);
+        assert_eq!(info.get("entry_limit"), Some(&json!(true)));
     }
 }

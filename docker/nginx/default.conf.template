@@ -1,0 +1,88 @@
+# Rendered by the official nginx image's envsubst entrypoint.
+#
+# ${NIMBO_DOMAIN} and ${NIMBO_PROXY_BODY_LIMIT} come from the environment.
+# Nginx runtime variables such as $host and $http_host are left untouched by
+# that entrypoint and are intentionally used below.
+#
+# Origin contract: Nimbo rejects mutating requests whose Origin host does not
+# match the request Host header. Preserve the browser-supplied Host value with
+# $http_host (including any non-default port) instead of rewriting it.
+
+limit_req_zone $binary_remote_addr zone=nimbo_auth:10m rate=20r/m;
+
+server {
+    listen 8080;
+    server_name ${NIMBO_DOMAIN};
+
+    # Keep the plain-HTTP listener minimal; it only redirects to TLS.
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 8443 ssl;
+    http2 on;
+    server_name ${NIMBO_DOMAIN};
+
+    ssl_certificate     /etc/nginx/tls/fullchain.pem;
+    ssl_certificate_key /etc/nginx/tls/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache   shared:nimbo_tls:10m;
+    ssl_session_timeout 1d;
+
+    server_tokens off;
+
+    # The application enforces NIMBO_MAX_UPLOAD_MB per file and a slightly
+    # larger whole-request cap. This proxy limit must not be lower.
+    client_max_body_size ${NIMBO_PROXY_BODY_LIMIT};
+    client_body_timeout 60s;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "same-origin" always;
+
+    # Throttle credential-bearing and first-run endpoints at the edge in
+    # addition to the application's own controls.
+    location ~ ^/api/(auth/login|setup)$ {
+        limit_req zone=nimbo_auth burst=5 nodelay;
+        proxy_pass http://nimbo:8080;
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    location / {
+        proxy_pass http://nimbo:8080;
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        # Preserve Host exactly: Nimbo compares the Origin host with it.
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP $remote_addr;
+
+        # Stream uploads instead of buffering them on the proxy disk.
+        proxy_request_buffering off;
+        # Never buffer SSE agent responses or downloads.
+        proxy_buffering off;
+        proxy_cache off;
+
+        proxy_connect_timeout 10s;
+        # SSE and long uploads need a generous idle window.
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}

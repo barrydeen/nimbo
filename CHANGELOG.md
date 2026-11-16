@@ -7,13 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `docs/operations.md`: offline whole-volume backup/restore, integrity and blob
+  checks, restore drills, versioned upgrades, rollback, retention, log rotation
+  and an operational FAQ
+- `scripts/verify-operations.py`: deterministic checks for Compose defaults,
+  documentation claims, CI job coverage and committed secrets/private files
+- Docker build and persistence/health smoke test in CI, plus deterministic
+  production-dependency audits
+- Integrated release-binary security regression gate covering setup tokens,
+  login bounding, snippet escaping, symlinks, serialized document/tree
+  mutations, backup-token scope/replacement, ranges, framing, origin checks and
+  public payload minimization
+- Versioned GHCR image publication on `v*.*.*` tags with provenance, SBOM and
+  OCI source/revision labels
+- Android unit-test, lint, wrapper-validation and release-signing workflow
+  coverage; release builds fail closed when signing secrets are absent
+- Backup-scoped device tokens and the in-place file replacement endpoint
+
+### Changed
+
+- Compose now publishes only on `127.0.0.1` by default, supports a configurable
+  host/port, and includes resource limits, read-only root filesystems, dropped
+  capabilities, health checks, graceful stop time and rotated logs
+- Production Compose example provides an nginx TLS proxy with no direct Nimbo
+  port, preserved `Host`/`Origin` behavior, upload body limits and unbuffered
+  SSE; the proxy runs as unprivileged UID/GID 101 with owned tmpfs paths
+- Docker image metadata now records version, revision and source; runtime runs
+  as fixed UID/GID 10001 with a read-only-friendly layout
+- Quick start and configuration docs now describe effective document, upload
+  and public-archive limits accurately
+
+### Security
+
+- First-run setup supports a mandatory `NIMBO_SETUP_TOKEN`; remote setup must
+  happen after TLS is live
+- Security documentation now states that only provider API keys are encrypted
+  at rest; notes, database rows, blobs and backups are plaintext
+- Token-scope, HTTPS and unmetered-network guidance corrected for the Android
+  app
+- Android release signing is fail-closed in CI; no debug-signed release artifact
+  is produced when signing secrets are unavailable
+- CI actions are pinned to reviewed full commit SHAs, and Docker base/proxy
+  images default to verified multi-arch digests; the Gradle wrapper
+  distribution checksum is pinned and validated
+- SQLx was upgraded to 0.9 and its SQLite driver is locally patched to bundle
+  `libsqlite3-sys` 0.39.1/SQLite 3.54.1, resolving RUSTSEC-2026-0459; the Rust
+  audit now has no vulnerabilities (two compile-only unmaintained-crate warnings
+  remain with no fixed upgrade)
+- `.dockerignore` excludes review/test artifacts, runtime data and credential
+  material from image builds
+
+### Fixed
+
+- Corrected the extraction time-budget and encryption-at-rest claims in the
+  architecture documentation
+- Clarified the 8 MiB document/16 MiB JSON body limits and per-file versus
+  aggregate multipart upload limits
+
 ### Planned
 
 - File watcher so external vault edits are reindexed without a restart
 - Semantic search with chunking, embeddings and hybrid BM25 + vector ranking
 - Agent tool calls with confirm-before-apply writes
 - Resumable uploads and background folder-zip jobs
-- Backup/restore tooling and published release images
+- Built-in backup scheduling and point-in-time recovery tooling
 
 ## [0.1.0] - 2026-11-15
 

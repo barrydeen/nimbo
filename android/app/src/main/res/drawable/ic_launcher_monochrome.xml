@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Monochrome layer for themed launcher icons (Android 13+). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group android:translateX="24" android:translateY="24">
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M48,14c-7.32,0 -13.53,4.4 -16.27,10.69C29.84,25.13 27.56,24.53 25.15,24.53C16.86,24.53 10.14,31.25 10.14,39.54C10.14,39.71 10.15,39.88 10.15,40.05C4.52,41.98 0,47.45 0,53.83C0,61.62 6.35,68 14.14,68L48,68C57.05,68 64.36,60.69 64.36,51.64C64.36,43.29 58.16,36.42 50.07,35.44C49.6,23.69 50.22,14 48,14Z" />
+        <path
+            android:fillColor="#FF000000"
+            android:pathData="M32.18,32L32.18,42.18L26.36,42.18L36.55,54.55L46.73,42.18L40.91,42.18L40.91,32Z" />
+        <path
+            android:fillColor="#FF000000"
+            android:pathData="M24.73,58.18L48.36,58.18L48.36,62.73L24.73,62.73Z" />
+    </group>
+</vector>

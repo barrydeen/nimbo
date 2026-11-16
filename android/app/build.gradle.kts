@@ -6,15 +6,44 @@ plugins {
     id("com.google.devtools.ksp")
 }
 
-// Release signing reads properties from gradle.properties (or ~/.gradle/gradle.properties):
-//   nimbo.release.storeFile=/absolute/path/to/keystore
-//   nimbo.release.storePassword=...
-//   nimbo.release.keyAlias=...
-//   nimbo.release.keyPassword=...
-// Falls back to the debug keystore when unset so `assembleRelease` still produces a
-// side-loadable APK.
+// Release signing is intentionally fail-closed: `assembleRelease`/`bundleRelease`
+// refuse to run without a complete, stable release key instead of silently
+// signing with the per-machine debug key (which cannot update installed builds).
 
 fun propsOrNull(key: String): String? = project.rootProject.findProperty(key) as String?
+
+val releaseStoreFile = propsOrNull("nimbo.release.storeFile")
+val releaseStorePassword = propsOrNull("nimbo.release.storePassword")
+val releaseKeyAlias = propsOrNull("nimbo.release.keyAlias")
+val releaseKeyPassword = propsOrNull("nimbo.release.keyPassword")
+val releaseSigningConfigured = !releaseStoreFile.isNullOrBlank() &&
+    !releaseStorePassword.isNullOrBlank() &&
+    !releaseKeyAlias.isNullOrBlank() &&
+    !releaseKeyPassword.isNullOrBlank()
+val releaseBuildRequested = gradle.startParameter.taskNames.any {
+    it.contains("Release", ignoreCase = true) && !it.contains("Test", ignoreCase = true)
+}
+val releaseSigningError =
+    "Release signing is not configured. Set nimbo.release.storeFile, " +
+        "nimbo.release.storePassword, nimbo.release.keyAlias and nimbo.release.keyPassword " +
+        "in gradle.properties (or ~/.gradle/gradle.properties). Debug builds remain available."
+if (releaseBuildRequested && !releaseSigningConfigured) {
+    throw GradleException(releaseSigningError)
+}
+gradle.taskGraph.whenReady(
+    object : org.gradle.api.Action<org.gradle.api.execution.TaskExecutionGraph> {
+        override fun execute(graph: org.gradle.api.execution.TaskExecutionGraph) {
+            val hasReleaseTask = graph.allTasks.any { task ->
+                task.project == project && task.name in setOf(
+                    "assembleRelease",
+                    "bundleRelease",
+                    "packageRelease",
+                )
+            }
+            if (hasReleaseTask && !releaseSigningConfigured) throw GradleException(releaseSigningError)
+        }
+    },
+)
 
 android {
     namespace = "app.nimbo.backup"
@@ -29,13 +58,12 @@ android {
     }
 
     signingConfigs {
-        create("release") {
-            val storePath = propsOrNull("nimbo.release.storeFile")
-            if (storePath != null) {
-                storeFile = file(storePath)
-                storePassword = propsOrNull("nimbo.release.storePassword")
-                keyAlias = propsOrNull("nimbo.release.keyAlias")
-                keyPassword = propsOrNull("nimbo.release.keyPassword")
+        if (releaseSigningConfigured) {
+            create("release") {
+                storeFile = file(releaseStoreFile!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
             }
         }
     }
@@ -44,8 +72,7 @@ android {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfig = if (propsOrNull("nimbo.release.storeFile") != null) signingConfigs.getByName("release")
-                            else signingConfigs.getByName("debug")
+            signingConfig = if (releaseSigningConfigured) signingConfigs.getByName("release") else null
         }
     }
 
@@ -63,6 +90,10 @@ android {
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
     }
+}
+
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
 }
 
 dependencies {
@@ -91,6 +122,11 @@ dependencies {
     implementation("androidx.room:room-ktx:$room")
     ksp("androidx.room:room-compiler:$room")
 
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    implementation("androidx.appcompat:appcompat:1.7.0")
+
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
+
+    testImplementation("junit:junit:4.13.2")
 }

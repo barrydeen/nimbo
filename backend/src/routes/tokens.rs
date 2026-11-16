@@ -9,7 +9,10 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sqlx::SqliteConnection;
 use std::sync::Arc;
+
+const BACKUP_ROOT_NAME: &str = "Phone Backups";
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DeviceTokenRow {
@@ -20,6 +23,8 @@ pub struct DeviceTokenRow {
     pub token_hash: String,
     #[allow(dead_code)]
     pub user_id: String,
+    pub scope: String,
+    pub backup_root_id: Option<String>,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
     pub expires_at: Option<i64>,
@@ -47,6 +52,8 @@ pub fn token_json(row: &DeviceTokenRow) -> Value {
     json!({
         "id": row.id,
         "name": row.name,
+        "scope": row.scope,
+        "backup_root_id": row.backup_root_id,
         "created_at": row.created_at,
         "last_used_at": row.last_used_at,
         "expires_at": row.expires_at,
@@ -74,6 +81,20 @@ pub async fn list(
 #[derive(Deserialize)]
 pub struct CreateTokenRequest {
     pub name: String,
+    /// `full` (default) or `backup`. Backup tokens are bound to a root child
+    /// folder named `Phone Backups`, matching the Android backup path scheme.
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+pub fn validate_scope(raw: Option<&str>) -> Result<&'static str, ApiError> {
+    match raw.map(str::trim).filter(|scope| !scope.is_empty()) {
+        None | Some("full") => Ok("full"),
+        Some("backup") => Ok("backup"),
+        Some(other) => Err(ApiError::bad_request(format!(
+            "unknown token scope {other:?}; use full or backup"
+        ))),
+    }
 }
 
 pub async fn create(
@@ -90,21 +111,50 @@ pub async fn create(
             "token name is too long (max 100 characters)",
         ));
     }
+    let scope = validate_scope(req.scope.as_deref())?;
 
     let (raw, token_hash) = auth::new_device_token();
     let id = uuid::Uuid::new_v4().to_string();
     let now = crate::now();
-    sqlx::query(
-        "INSERT INTO device_tokens (id, name, token_hash, user_id, created_at) \
-         VALUES (?, ?, ?, ?, ?)",
-    )
-    .bind(&id)
-    .bind(name)
-    .bind(&token_hash)
-    .bind(&user.id)
-    .bind(now)
-    .execute(&state.pool)
-    .await?;
+
+    // BEGIN IMMEDIATE serializes folder discovery/creation with token insertion
+    // so concurrent backup-token creations agree on one root folder.
+    let mut conn = state.pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    let created = async {
+        let backup_root_id = if scope == "backup" {
+            Some(ensure_backup_root(&mut conn, &user.id).await?)
+        } else {
+            None
+        };
+        sqlx::query(
+            "INSERT INTO device_tokens \
+             (id, name, token_hash, user_id, scope, backup_root_id, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(&token_hash)
+        .bind(&user.id)
+        .bind(scope)
+        .bind(&backup_root_id)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+        Ok::<Option<String>, ApiError>(backup_root_id)
+    }
+    .await;
+
+    let backup_root_id = match created {
+        Ok(backup_root_id) => {
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            backup_root_id
+        }
+        Err(err) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Err(err);
+        }
+    };
 
     audit(&state, &user.id, "tokens.create", &format!("{name} ({id})")).await;
 
@@ -113,6 +163,8 @@ pub async fn create(
         name: name.to_string(),
         token_hash,
         user_id: user.id.clone(),
+        scope: scope.to_string(),
+        backup_root_id,
         created_at: now,
         last_used_at: None,
         expires_at: None,
@@ -120,6 +172,65 @@ pub async fn create(
     };
     // The raw token is returned exactly once and never persisted.
     Ok(Json(json!({ "token": raw, "item": token_json(&row) })))
+}
+
+/// Finds or creates the instance-wide `Phone Backups` root folder. `INSERT OR
+/// IGNORE` plus the sibling-name unique index makes this idempotent even if an
+/// earlier transaction raced us.
+async fn ensure_backup_root(
+    conn: &mut SqliteConnection,
+    owner_id: &str,
+) -> Result<String, ApiError> {
+    let existing: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM nodes WHERE parent_id = 'root' AND kind = 'folder' \
+         AND name = ? COLLATE NOCASE LIMIT 1",
+    )
+    .bind(BACKUP_ROOT_NAME)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some((id,)) = existing {
+        return Ok(id);
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = crate::now();
+    sqlx::query(
+        "INSERT OR IGNORE INTO nodes \
+         (id, parent_id, kind, name, owner_id, created_at, updated_at) \
+         VALUES (?, 'root', 'folder', ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(BACKUP_ROOT_NAME)
+    .bind(owner_id)
+    .bind(now)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM nodes WHERE parent_id = 'root' AND kind = 'folder' \
+         AND name = ? COLLATE NOCASE LIMIT 1",
+    )
+    .bind(BACKUP_ROOT_NAME)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some((id,)) = row {
+        return Ok(id);
+    }
+
+    let occupied: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM nodes WHERE parent_id = 'root' AND name = ? COLLATE NOCASE LIMIT 1",
+    )
+    .bind(BACKUP_ROOT_NAME)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if occupied.is_some() {
+        return Err(ApiError::conflict(format!(
+            "a non-folder item named {BACKUP_ROOT_NAME} exists at the drive root; \
+             rename it before creating a backup token"
+        )));
+    }
+    Err(ApiError::internal("could not create backup folder"))
 }
 
 pub async fn revoke(
@@ -173,6 +284,8 @@ mod tests {
             name: "phone".into(),
             token_hash: "deadbeef".into(),
             user_id: "u1".into(),
+            scope: "backup".into(),
+            backup_root_id: Some("root-folder".into()),
             created_at: 1,
             last_used_at: Some(2),
             expires_at: None,
@@ -181,5 +294,16 @@ mod tests {
         let value = token_json(&row);
         assert!(value.get("token_hash").is_none());
         assert_eq!(value["status"], "active");
+        assert_eq!(value["scope"], "backup");
+        assert_eq!(value["backup_root_id"], "root-folder");
+    }
+
+    #[test]
+    fn scopes_are_explicit() {
+        assert_eq!(validate_scope(None).unwrap(), "full");
+        assert_eq!(validate_scope(Some("full")).unwrap(), "full");
+        assert_eq!(validate_scope(Some("backup")).unwrap(), "backup");
+        assert!(validate_scope(Some("admin")).is_err());
+        assert!(validate_scope(Some("")).is_ok());
     }
 }

@@ -3,6 +3,14 @@ export type Bootstrap = {
 	setup_complete: boolean;
 	instance_name: string;
 	user: User | null;
+	/** Present when the server requires NIMBO_SETUP_TOKEN during setup. */
+	setup_token_required?: boolean;
+};
+export type InstanceInfo = {
+	setup_complete?: boolean;
+	instance_name?: string;
+	max_upload_bytes?: number;
+	backup_scope?: boolean;
 };
 export type DocMeta = { path: string; title: string; updated_at: number };
 export type DocContent = { path: string; content: string; hash: string; title: string };
@@ -40,6 +48,7 @@ export type FileNode = {
 	vision_status?: string;
 	path?: string;
 	snippet?: string;
+	sha256?: string | null;
 };
 
 export type Breadcrumb = { id: string; name: string };
@@ -48,6 +57,7 @@ export type FileListing = {
 	folder: { id: string; name: string; parent_id: string };
 	breadcrumbs: Breadcrumb[];
 	items: FileNode[];
+	next_offset?: number | null;
 };
 
 export type FileVision = {
@@ -98,6 +108,8 @@ export type FilesStats = {
 	active_shares: number;
 };
 
+export type TokenScope = 'full' | 'backup';
+
 export type DeviceToken = {
 	id: string;
 	name: string;
@@ -105,12 +117,28 @@ export type DeviceToken = {
 	last_used_at: number | null;
 	expires_at: number | null;
 	revoked_at: number | null;
-	status: 'active' | 'expired';
+	status: 'active' | 'expired' | 'revoked';
+	/** Older servers omit scope; they behave as full-account tokens. */
+	scope?: TokenScope;
+	backup_root_id?: string | null;
 };
 
 export type UploadResult = {
 	uploaded: FileNode[];
 	failed: { name: string; error: string }[];
+};
+
+/**
+ * Minimal public-share node. The public API intentionally omits parent IDs,
+ * modification timestamps and all private indexing metadata.
+ */
+export type PublicFileNode = {
+	id: string;
+	kind: 'file' | 'folder';
+	name: string;
+	mime: string | null;
+	size: number;
+	has_thumb?: boolean;
 };
 
 export type PublicShare = {
@@ -119,17 +147,38 @@ export type PublicShare = {
 	kind: 'file' | 'folder';
 	name: string;
 	expires_at: number | null;
-	file?: FileNode;
-	folder?: { id: string; name: string; parent_id: string };
+	file?: PublicFileNode;
+	folder?: { id: string; name: string; parent_id?: string };
 	breadcrumbs?: Breadcrumb[];
-	items?: FileNode[];
+	items?: PublicFileNode[];
+	truncated?: boolean;
 };
 
 export type PublicListing = {
-	folder: { id: string; name: string; parent_id: string };
+	folder: { id: string; name: string; parent_id?: string };
 	breadcrumbs: Breadcrumb[];
-	items: FileNode[];
+	items: PublicFileNode[];
+	truncated?: boolean;
 };
+
+/** Structured API failure, including the HTTP status needed for auth policy. */
+export class ApiError extends Error {
+	status: number;
+
+	constructor(message: string, status: number) {
+		super(message);
+		this.name = 'ApiError';
+		this.status = status;
+	}
+}
+
+export function isUnauthorized(error: unknown): boolean {
+	return error instanceof ApiError && error.status === 401;
+}
+
+export function errorMessage(error: unknown, fallback = 'Something went wrong'): string {
+	return error instanceof Error && error.message ? error.message : fallback;
+}
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 	const headers: Record<string, string> = {
@@ -151,14 +200,20 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 			(data && typeof data === 'object' && 'error' in data
 				? String((data as { error: unknown }).error)
 				: null) ?? `${res.status} ${res.statusText}`;
-		throw new Error(message);
+		throw new ApiError(message, res.status);
 	}
 	return data as T;
 }
 
 export const api = {
 	bootstrap: () => request<Bootstrap>('/api/bootstrap'),
-	setup: (body: { instance_name: string; username: string; password: string }) =>
+	instance: () => request<InstanceInfo>('/api/instance'),
+	setup: (body: {
+		instance_name: string;
+		username: string;
+		password: string;
+		setup_token?: string;
+	}) =>
 		request<{ instance_name: string; user: User }>('/api/setup', {
 			method: 'POST',
 			body: JSON.stringify(body)
@@ -170,8 +225,8 @@ export const api = {
 		}),
 	logout: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
 	tree: () => request<{ documents: DocMeta[] }>('/api/docs/tree'),
-	getDoc: (path: string) =>
-		request<DocContent>(`/api/docs/content?path=${encodeURIComponent(path)}`),
+	getDoc: (path: string, signal?: AbortSignal) =>
+		request<DocContent>(`/api/docs/content?path=${encodeURIComponent(path)}`, { signal }),
 	saveDoc: (body: { path: string; content: string; base_hash: string | null }) =>
 		request<{ path: string; hash: string }>('/api/docs/content', {
 			method: 'PUT',
@@ -186,10 +241,10 @@ export const api = {
 			method: 'POST',
 			body: JSON.stringify({ from, to })
 		}),
-	backlinks: (path: string) =>
-		request<Backlinks>(`/api/docs/backlinks?path=${encodeURIComponent(path)}`),
-	search: (q: string) =>
-		request<{ results: SearchResult[] }>(`/api/search?q=${encodeURIComponent(q)}`),
+	backlinks: (path: string, signal?: AbortSignal) =>
+		request<Backlinks>(`/api/docs/backlinks?path=${encodeURIComponent(path)}`, { signal }),
+	search: (q: string, signal?: AbortSignal) =>
+		request<{ results: SearchResult[] }>(`/api/search?q=${encodeURIComponent(q)}`, { signal }),
 	getLlm: () => request<LlmSettings>('/api/settings/llm'),
 	saveLlm: (body: {
 		base_url: string;
@@ -198,6 +253,8 @@ export const api = {
 		temperature?: number;
 		vision_model?: string;
 		describe_images?: boolean;
+		clear_api_key?: boolean;
+		confirm_reuse_api_key?: boolean;
 	}) =>
 		request<LlmSettings>('/api/settings/llm', {
 			method: 'PUT',
@@ -205,22 +262,35 @@ export const api = {
 		}),
 	testLlm: () =>
 		request<{ ok: boolean; reply: string }>('/api/settings/llm/test', { method: 'POST' }),
-	agentAction: (body: {
-		action: string;
-		path?: string;
-		text?: string;
-		instruction?: string;
-	}) =>
-		request<{ action: string; text: string }>('/api/agent/action', {
-			method: 'POST',
-			body: JSON.stringify(body)
-		}),
-
-	listFiles: (folderId?: string | null) =>
-		request<FileListing>(
-			`/api/files${folderId ? `?folder_id=${encodeURIComponent(folderId)}` : ''}`
+	agentAction: (
+		body: {
+			action: string;
+			path?: string;
+			text?: string;
+			instruction?: string;
+		},
+		signal?: AbortSignal
+	) =>
+		request<{ action: string; text: string; processed_chars?: number; truncated?: boolean }>(
+			'/api/agent/action',
+			{
+				method: 'POST',
+				body: JSON.stringify(body),
+				signal
+			}
 		),
-	recentFiles: () => request<{ items: FileNode[] }>('/api/files/recent'),
+
+	listFiles: (
+		folderId?: string | null,
+		signal?: AbortSignal,
+		offset = 0,
+		limit = 500
+	) => {
+		const query = new URLSearchParams({ offset: String(offset), limit: String(limit) });
+		if (folderId) query.set('folder_id', folderId);
+		return request<FileListing>(`/api/files?${query}`, { signal });
+	},
+	recentFiles: (signal?: AbortSignal) => request<{ items: FileNode[] }>('/api/files/recent', { signal }),
 	createFolder: (body: { parent_id?: string | null; name: string }) =>
 		request<{ item: FileNode }>('/api/files/folders', {
 			method: 'POST',
@@ -233,16 +303,17 @@ export const api = {
 		}),
 	deleteNode: (id: string) =>
 		request<{ deleted: string; count: number }>(`/api/files/${id}`, { method: 'DELETE' }),
-	fileDetails: (id: string) => request<FileDetails>(`/api/files/${id}`),
-	searchFiles: (q: string) =>
-		request<{ results: FileNode[] }>(`/api/files/search?q=${encodeURIComponent(q)}`),
-	filesStats: () => request<FilesStats>('/api/files/stats'),
+	fileDetails: (id: string, signal?: AbortSignal) =>
+		request<FileDetails>(`/api/files/${id}`, { signal }),
+	searchFiles: (q: string, signal?: AbortSignal) =>
+		request<{ results: FileNode[] }>(`/api/files/search?q=${encodeURIComponent(q)}`, { signal }),
+	filesStats: (signal?: AbortSignal) => request<FilesStats>('/api/files/stats', { signal }),
 	retryVision: (id: string) =>
 		request<{ ok: boolean }>(`/api/files/${id}/vision`, { method: 'POST' }),
 	reindexFile: (id: string) =>
 		request<{ ok: boolean }>(`/api/files/${id}/reindex`, { method: 'POST' }),
 
-	listShares: () => request<{ shares: ShareLink[] }>('/api/shares'),
+	listShares: (signal?: AbortSignal) => request<{ shares: ShareLink[] }>('/api/shares', { signal }),
 	createShare: (body: {
 		target_type: 'file' | 'folder';
 		target_id: string;
@@ -261,21 +332,22 @@ export const api = {
 		request<{ share: ShareLink }>(`/api/shares/${id}`, { method: 'DELETE' }),
 
 	listTokens: () => request<{ items: DeviceToken[] }>('/api/tokens'),
-	createToken: (name: string) =>
+	createToken: (name: string, scope: TokenScope = 'full') =>
 		request<{ token: string; item: DeviceToken }>('/api/tokens', {
 			method: 'POST',
-			body: JSON.stringify({ name })
+			body: JSON.stringify({ name, scope })
 		}),
 	revokeToken: (id: string) =>
 		request<{ ok: boolean }>(`/api/tokens/${id}`, { method: 'DELETE' }),
 
-	publicShare: (token: string) =>
-		request<PublicShare>(`/api/public/shares/${encodeURIComponent(token)}`),
-	publicNodes: (token: string, folderId?: string | null) =>
+	publicShare: (token: string, signal?: AbortSignal) =>
+		request<PublicShare>(`/api/public/shares/${encodeURIComponent(token)}`, { signal }),
+	publicNodes: (token: string, folderId?: string | null, signal?: AbortSignal) =>
 		request<PublicListing>(
 			`/api/public/shares/${encodeURIComponent(token)}/nodes${
 				folderId ? `?folder_id=${encodeURIComponent(folderId)}` : ''
-			}`
+			}`,
+			{ signal }
 		)
 };
 
@@ -293,23 +365,55 @@ export const publicZipUrl = (token: string, folderId?: string | null) =>
 		folderId ? `?folder_id=${encodeURIComponent(folderId)}` : ''
 	}`;
 
-export function uploadFiles(
+export class UploadError extends ApiError {
+	/** True when the server may have committed the file before failing. */
+	ambiguous: boolean;
+
+	constructor(message: string, status: number, ambiguous = false) {
+		super(message, status);
+		this.name = 'UploadError';
+		this.ambiguous = ambiguous;
+	}
+}
+
+export type UploadOptions = {
+	signal?: AbortSignal;
+	timeoutMs?: number;
+	onProgress?: (percent: number) => void;
+};
+
+/** Upload one file so count/aggregate body limits and outcomes are isolated. */
+export function uploadFile(
 	folderId: string | null,
-	files: File[],
-	onProgress?: (percent: number, loaded: number, total: number) => void
+	file: File,
+	options: UploadOptions = {}
 ): Promise<UploadResult> {
 	return new Promise((resolve, reject) => {
 		const form = new FormData();
-		for (const file of files) form.append('file', file, file.name);
+		form.append('file', file, file.name);
 		const xhr = new XMLHttpRequest();
+		const timeoutMs = options.timeoutMs ?? 120_000;
+
+		const cleanup = () => {
+			options.signal?.removeEventListener('abort', onAbort);
+		};
+		const fail = (error: UploadError) => {
+			cleanup();
+			reject(error);
+		};
+		const onAbort = () => {
+			xhr.abort();
+		};
+
 		xhr.open(
 			'POST',
 			`/api/files/upload${folderId ? `?folder_id=${encodeURIComponent(folderId)}` : ''}`
 		);
 		xhr.withCredentials = true;
+		xhr.timeout = timeoutMs;
 		xhr.upload.onprogress = (event) => {
-			if (event.lengthComputable && onProgress) {
-				onProgress(Math.round((event.loaded / event.total) * 100), event.loaded, event.total);
+			if (event.lengthComputable && options.onProgress) {
+				options.onProgress(Math.round((event.loaded / event.total) * 100));
 			}
 		};
 		xhr.onload = () => {
@@ -320,16 +424,72 @@ export function uploadFiles(
 				data = null;
 			}
 			if (xhr.status >= 200 && xhr.status < 300) {
+				cleanup();
 				resolve(data as UploadResult);
-			} else {
-				const message =
-					data && typeof data === 'object' && 'error' in data
-						? String((data as { error: unknown }).error)
-						: `Upload failed (${xhr.status})`;
-				reject(new Error(message));
+				return;
 			}
+			const message =
+				data && typeof data === 'object' && 'error' in data
+					? String((data as { error: unknown }).error)
+					: `Upload failed (${xhr.status})`;
+			fail(new UploadError(message, xhr.status, xhr.status >= 500));
 		};
-		xhr.onerror = () => reject(new Error('Upload failed. Check your connection.'));
+		xhr.onerror = () =>
+			fail(new UploadError('Upload failed. Check your connection and the folder contents.', 0, true));
+		xhr.ontimeout = () =>
+			fail(
+				new UploadError(
+					`Upload timed out after ${Math.round(timeoutMs / 1000)}s. The file may already be stored; refresh the folder before retrying.`,
+					0,
+					true
+				)
+			);
+		xhr.onabort = () => {
+			cleanup();
+			reject(new DOMException('Upload cancelled', 'AbortError'));
+		};
+
+		if (options.signal) {
+			if (options.signal.aborted) {
+				reject(new DOMException('Upload cancelled', 'AbortError'));
+				return;
+			}
+			options.signal.addEventListener('abort', onAbort, { once: true });
+		}
 		xhr.send(form);
 	});
+}
+
+/**
+ * Compatibility helper for callers that still pass a file list. It uploads one
+ * file per request instead of relying on a single aggregate multipart body.
+ */
+export async function uploadFiles(
+	folderId: string | null,
+	files: File[],
+	onProgress?: (percent: number, loaded: number, total: number) => void,
+	options: UploadOptions = {}
+): Promise<UploadResult> {
+	const uploaded: FileNode[] = [];
+	const failed: { name: string; error: string }[] = [];
+	for (let index = 0; index < files.length; index += 1) {
+		const file = files[index];
+		try {
+			const result = await uploadFile(folderId, file, {
+				...options,
+				onProgress: (percent) => {
+					const overall = Math.round(((index + percent / 100) / files.length) * 100);
+					onProgress?.(overall, index, files.length);
+				}
+			});
+			uploaded.push(...(result.uploaded ?? []));
+			failed.push(...(result.failed ?? []));
+		} catch (err) {
+			failed.push({
+				name: file.name,
+				error: err instanceof Error ? err.message : 'Upload failed'
+			});
+		}
+	}
+	return { uploaded, failed };
 }

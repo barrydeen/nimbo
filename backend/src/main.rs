@@ -15,7 +15,7 @@ use axum::{
     routing::{any, delete, get, post},
     Router,
 };
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tower_http::{
     compression::CompressionLayer,
     services::{ServeDir, ServeFile},
@@ -23,16 +23,31 @@ use tower_http::{
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+const AUTH_BODY_LIMIT: usize = 8 * 1024;
+const DOC_BODY_LIMIT: usize = 16 * 1024 * 1024;
+const AGENT_BODY_LIMIT: usize = 1024 * 1024;
+const SETTINGS_BODY_LIMIT: usize = 64 * 1024;
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+const RETENTION_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
 /// Current unix time in seconds.
 pub fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Hidden parser-subprocess entry point. This must run before tracing or any
+    // server configuration: the child extracts one blob and exits, so it can
+    // never start the HTTP server, retention job, or index/vision workers.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--extract-worker")) {
+        files::worker::run_extract_worker_cli()?;
+        return Ok(());
+    }
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -45,15 +60,41 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(cfg.vault_dir())?;
     std::fs::create_dir_all(cfg.files_dir())?;
     std::fs::create_dir_all(cfg.upload_tmp_dir())?;
+    if let Some(static_dir) = &cfg.static_dir {
+        if !static_dir.is_dir() {
+            anyhow::bail!(
+                "NIMBO_STATIC_DIR {:?} does not exist or is not a directory",
+                static_dir
+            );
+        }
+    }
+    if cfg.non_loopback_plain_http() {
+        tracing::warn!(
+            bind = %cfg.bind,
+            "listening beyond loopback without secure cookies; terminate TLS in a trusted proxy \
+             before exposing credentials"
+        );
+    }
+
     let secret = crypto::load_or_create_secret(&cfg.data_dir)?;
     let pool = db::init(&cfg.data_dir).await?;
     db::ensure_settings(&pool).await?;
+    if let Err(err) = db::retention_cleanup(&pool, cfg.audit_retention_days).await {
+        tracing::warn!(error = %err, "startup retention cleanup failed");
+    }
+
+    let dummy_password_hash =
+        auth::hash_password(&uuid::Uuid::new_v4().to_string()).map_err(|err| {
+            anyhow::anyhow!("could not initialise password verifier: {}", err.message)
+        })?;
 
     let state = Arc::new(state::AppState {
-        pool,
+        pool: pool.clone(),
         cfg: cfg.clone(),
         secret,
-        login_failures: Default::default(),
+        login_limiter: Default::default(),
+        password_semaphore: Arc::new(tokio::sync::Semaphore::new(auth::PASSWORD_HASH_CONCURRENCY)),
+        dummy_password_hash,
     });
 
     if let Err(err) = routes::docs::reindex_all(&state).await {
@@ -61,13 +102,32 @@ async fn main() -> anyhow::Result<()> {
     }
     files::worker::spawn(state.clone());
 
-    let upload_limit = cfg.max_upload_bytes as usize + 1024 * 1024;
+    let retention_pool = pool.clone();
+    let audit_retention_days = cfg.audit_retention_days;
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(RETENTION_INTERVAL).await;
+            if let Err(err) = db::retention_cleanup(&retention_pool, audit_retention_days).await {
+                tracing::warn!(error = %err, "periodic retention cleanup failed");
+            }
+        }
+    });
+
+    let upload_limit = cfg.upload_request_limit()?;
+
     let public = Router::new()
+        .route("/livez", get(routes::health::livez))
         .route("/healthz", get(routes::health::healthz))
         .route("/api/bootstrap", get(routes::bootstrap::bootstrap))
         .route("/api/setup/status", get(routes::setup::status))
-        .route("/api/setup", post(routes::setup::complete_setup))
-        .route("/api/auth/login", post(routes::auth::login))
+        .route(
+            "/api/setup",
+            post(routes::setup::complete_setup).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT)),
+        )
+        .route(
+            "/api/auth/login",
+            post(routes::auth::login).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT)),
+        )
         .route("/api/public/shares/{token}", get(routes::public::share))
         .route(
             "/api/public/shares/{token}/nodes",
@@ -100,7 +160,8 @@ async fn main() -> anyhow::Result<()> {
             "/api/docs/content",
             get(routes::docs::get_content)
                 .put(routes::docs::put_content)
-                .delete(routes::docs::delete_content),
+                .delete(routes::docs::delete_content)
+                .layer(DefaultBodyLimit::max(DOC_BODY_LIMIT)),
         )
         .route("/api/docs/rename", post(routes::docs::rename))
         .route("/api/docs/backlinks", get(routes::docs::backlinks))
@@ -120,7 +181,12 @@ async fn main() -> anyhow::Result<()> {
                 .patch(routes::files::update_node)
                 .delete(routes::files::delete_node),
         )
-        .route("/api/files/{id}/content", get(routes::files::content))
+        .route(
+            "/api/files/{id}/content",
+            get(routes::files::content)
+                .put(routes::files::replace_content)
+                .layer(DefaultBodyLimit::max(upload_limit)),
+        )
         .route("/api/files/{id}/download", get(routes::files::download))
         .route("/api/files/{id}/thumbnail", get(routes::files::thumbnail))
         .route("/api/files/{id}/vision", post(routes::files::retry_vision))
@@ -135,16 +201,29 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/api/tokens",
-            get(routes::tokens::list).post(routes::tokens::create),
+            get(routes::tokens::list)
+                .post(routes::tokens::create)
+                .layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT)),
         )
         .route("/api/tokens/{id}", delete(routes::tokens::revoke))
         .route(
             "/api/settings/llm",
-            get(routes::settings::get_llm).put(routes::settings::put_llm),
+            get(routes::settings::get_llm)
+                .put(routes::settings::put_llm)
+                .layer(DefaultBodyLimit::max(SETTINGS_BODY_LIMIT)),
         )
-        .route("/api/settings/llm/test", post(routes::settings::test_llm))
-        .route("/api/agent/chat", post(routes::agent::chat))
-        .route("/api/agent/action", post(routes::agent::action))
+        .route(
+            "/api/settings/llm/test",
+            post(routes::settings::test_llm).layer(DefaultBodyLimit::max(SETTINGS_BODY_LIMIT)),
+        )
+        .route(
+            "/api/agent/chat",
+            post(routes::agent::chat).layer(DefaultBodyLimit::max(AGENT_BODY_LIMIT)),
+        )
+        .route(
+            "/api/agent/action",
+            post(routes::agent::action).layer(DefaultBodyLimit::max(AGENT_BODY_LIMIT)),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_session,
@@ -157,7 +236,8 @@ async fn main() -> anyhow::Result<()> {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::origin_check,
-        ));
+        ))
+        .layer(middleware::from_fn(auth::json_error_shape));
 
     let mut app = api;
     if let Some(static_dir) = &cfg.static_dir {
@@ -168,10 +248,80 @@ async fn main() -> anyhow::Result<()> {
 
     let app = app
         .layer(TraceLayer::new_for_http())
-        .layer(CompressionLayer::new());
+        .layer(CompressionLayer::new())
+        .layer(middleware::from_fn(auth::security_headers));
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind).await?;
     tracing::info!(addr = %cfg.bind, data = %cfg.data_dir.display(), "nimbo listening");
-    axum::serve(listener, app).await?;
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal());
+    match tokio::time::timeout(SHUTDOWN_GRACE, server).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            pool.close().await;
+            return Err(err.into());
+        }
+        Err(_) => tracing::warn!("graceful shutdown exceeded its drain budget; exiting"),
+    }
+    pool.close().await;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "could not install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutdown signal received; draining requests");
+}
+
+#[cfg(test)]
+mod tests {
+    /// The parser subprocess shares the server binary; the hidden dispatch must
+    /// stay ahead of tracing/config/state initialization so a child can never
+    /// acquire the database, bind the listener, or spawn workers.
+    #[test]
+    fn extract_worker_dispatch_precedes_server_initialization() {
+        let source = include_str!("main.rs");
+        let dispatch = source
+            .find("--extract-worker")
+            .expect("extract worker dispatch is missing");
+        let tracing = source
+            .find("tracing_subscriber::registry")
+            .expect("tracing initialization is missing");
+        let state = source
+            .find("state::AppState {")
+            .expect("state initialization is missing");
+        assert!(
+            dispatch < tracing,
+            "extract worker dispatch must precede tracing initialization"
+        );
+        assert!(
+            dispatch < state,
+            "extract worker dispatch must precede state/database initialization"
+        );
+    }
 }

@@ -10,7 +10,7 @@ pub async fn bootstrap(
 ) -> Result<Json<Value>, ApiError> {
     let setup_complete = db::get_setting(&state.pool, "setup_complete")
         .await?
-        .map(|v| v == "true")
+        .map(|value| value == "true")
         .unwrap_or(false);
     let instance_name = db::get_setting(&state.pool, "instance_name")
         .await?
@@ -23,6 +23,7 @@ pub async fn bootstrap(
 
     Ok(Json(json!({
         "setup_complete": setup_complete,
+        "setup_token_required": state.cfg.setup_token.is_some(),
         "instance_name": instance_name,
         "user": user,
     })))

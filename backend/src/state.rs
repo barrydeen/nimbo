@@ -1,7 +1,7 @@
-use crate::config::Config;
+use crate::{auth::LoginLimiter, config::Config};
 use sqlx::SqlitePool;
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use tokio::sync::Semaphore;
 
 pub struct AppState {
     pub pool: SqlitePool,
@@ -9,6 +9,11 @@ pub struct AppState {
     /// Instance-wide secret used to encrypt sensitive settings (e.g. API keys).
     #[allow(dead_code)]
     pub secret: [u8; 32],
-    /// Failed login attempts keyed by username, used for basic rate limiting.
-    pub login_failures: Mutex<HashMap<String, Vec<i64>>>,
+    /// Bounded, evicting, atomically-reserved login attempt limiter.
+    pub login_limiter: Mutex<LoginLimiter>,
+    /// Caps the number of concurrent (expensive) Argon2 operations.
+    pub password_semaphore: Arc<Semaphore>,
+    /// Hash of a random throwaway password, verified for unknown usernames so
+    /// user enumeration does not get a cheap timing signal.
+    pub dummy_password_hash: String,
 }

@@ -1,9 +1,18 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { goto, replaceState } from '$app/navigation';
-	import { api, type DocMeta, type SearchResult, type User } from '$lib/api';
+	import { onDestroy, onMount, tick } from 'svelte';
+	import { beforeNavigate, goto, replaceState } from '$app/navigation';
+	import {
+		api,
+		errorMessage,
+		isUnauthorized,
+		type DocMeta,
+		type SearchResult,
+		type User
+	} from '$lib/api';
 	import Editor from '$lib/components/Editor.svelte';
-	import { marked } from 'marked';
+	import { RequestScope, isAbortError } from '$lib/generations';
+	import { normalizeWikiTarget, renderMarkdown } from '$lib/markdown';
+	import { sanitizeSnippet } from '$lib/sanitize';
 
 	let user: User | null = null;
 	let instanceName = 'Nimbo';
@@ -14,9 +23,11 @@
 	let hash = '';
 	let dirty = false;
 	let saving = false;
+	let saveQueued = false;
 	let split = true;
 	let aiEnabled = false;
 	let editorKey = 0;
+	let contentVersion = 0;
 
 	let backlinks: { path: string; title: string }[] = [];
 	let outlinks: { target: string; path: string | null; exists: boolean }[] = [];
@@ -31,6 +42,14 @@
 
 	let errorMsg = '';
 	let statusMsg = '';
+	let statusTimer: ReturnType<typeof setTimeout> | null = null;
+	let initError = '';
+	let initBusy = false;
+	let disposed = false;
+	let loggingOut = false;
+
+	let previewHtml = '';
+	let previewTimer: ReturnType<typeof setTimeout> | null = null;
 
 	let railTab: 'links' | 'chat' = 'links';
 	let agentMessages: {
@@ -44,28 +63,98 @@
 	let msgSeq = 0;
 	let searchTimer: ReturnType<typeof setTimeout> | null = null;
 
-	onMount(async () => {
+	const docScope = new RequestScope();
+	const linkScope = new RequestScope();
+	const searchScope = new RequestScope();
+	const MAX_AGENT_MESSAGES = 40;
+
+	let agentAbort: AbortController | null = null;
+	let agentRun = 0;
+	let agentFlushHandle: number | null = null;
+	let agentPending = '';
+	let agentAssistantId = 0;
+
+	onMount(() => {
+		void init();
+		return () => {
+			disposed = true;
+			abortAgent();
+			docScope.invalidate();
+			linkScope.invalidate();
+			searchScope.invalidate();
+			if (previewTimer) clearTimeout(previewTimer);
+			if (searchTimer) clearTimeout(searchTimer);
+			if (statusTimer) clearTimeout(statusTimer);
+		};
+	});
+
+	onDestroy(() => {
+		disposed = true;
+		abortAgent();
+	});
+
+	beforeNavigate(() => {
+		abortAgent();
+	});
+
+	function message(err: unknown): string {
+		return errorMessage(err);
+	}
+
+	function flash(text: string) {
+		statusMsg = text;
+		if (statusTimer) clearTimeout(statusTimer);
+		statusTimer = setTimeout(() => (statusMsg = ''), 1600);
+	}
+
+	async function init() {
+		initBusy = true;
+		initError = '';
+		errorMsg = '';
 		try {
-			const boot = await api.bootstrap();
+			let boot;
+			try {
+				boot = await api.bootstrap();
+			} catch (err) {
+				if (disposed) return;
+				if (isUnauthorized(err)) {
+					await goto('/login');
+				} else {
+					initError = `Could not reach the server: ${message(err)}`;
+				}
+				return;
+			}
+			if (disposed) return;
 			if (!boot.setup_complete) {
-				goto('/setup');
+				await goto('/setup');
 				return;
 			}
 			if (!boot.user) {
-				goto('/login');
+				await goto('/login');
 				return;
 			}
 			user = boot.user;
 			instanceName = boot.instance_name;
-			await refresh();
-			const path = new URLSearchParams(location.search).get('path');
-			if (path) {
-				await openDoc(path);
+
+			try {
+				await refresh();
+				if (disposed) return;
+				const path = new URLSearchParams(location.search).get('path');
+				if (path) {
+					await openDoc(path);
+				}
+			} catch (err) {
+				if (disposed) return;
+				if (isUnauthorized(err)) {
+					await goto('/login');
+					return;
+				}
+				initError = `Your documents could not be loaded: ${message(err)}`;
 			}
-		} catch {
-			goto('/login');
+		} finally {
+			if (!disposed) initBusy = false;
 		}
-	});
+	}
 
 	function warn(event: BeforeUnloadEvent) {
 		if (dirty) {
@@ -79,54 +168,149 @@
 		docs = tree.documents;
 	}
 
-	function message(err: unknown): string {
-		return err instanceof Error ? err.message : 'Something went wrong';
+	function schedulePreview(immediate = false) {
+		if (previewTimer) {
+			clearTimeout(previewTimer);
+			previewTimer = null;
+		}
+		if (!split) return;
+		if (immediate) {
+			previewHtml = renderMarkdown(content);
+			return;
+		}
+		previewTimer = setTimeout(() => {
+			previewTimer = null;
+			previewHtml = renderMarkdown(content);
+		}, 180);
 	}
 
-	async function openDoc(path: string) {
-		if (dirty && !confirm('Discard unsaved changes?')) return;
+	function dedupeLinks(
+		links: { target: string; path: string | null; exists: boolean }[]
+	): { target: string; path: string | null; exists: boolean }[] {
+		const seen = new Set<string>();
+		return links.filter((link) => {
+			const key = link.target.toLowerCase();
+			if (seen.has(key)) return false;
+			seen.add(key);
+			return true;
+		});
+	}
+
+	function dedupeBacklinks(
+		links: { path: string; title: string }[]
+	): { path: string; title: string }[] {
+		const seen = new Set<string>();
+		return links.filter((link) => {
+			const key = link.path.toLowerCase();
+			if (seen.has(key)) return false;
+			seen.add(key);
+			return true;
+		});
+	}
+
+	async function loadLinks(path: string, docOp: number) {
+		const op = linkScope.begin();
 		try {
-			const doc = await api.getDoc(path);
+			const connections = await api.backlinks(path, op.signal);
+			if (!docScope.isCurrent(docOp) || selected !== path || !linkScope.isCurrent(op.id)) return;
+			backlinks = dedupeBacklinks(connections.backlinks);
+			outlinks = dedupeLinks(connections.links);
+		} catch (err) {
+			if (isAbortError(err) || !linkScope.isCurrent(op.id)) return;
+			if (isUnauthorized(err)) {
+				void goto('/login');
+				return;
+			}
+			// A link-index failure must not replace the editor contents.
+			errorMsg = `Links could not be loaded: ${message(err)}`;
+		}
+	}
+
+	async function openDoc(path: string, options: { force?: boolean } = {}) {
+		if (dirty && !options.force && !confirm('Discard unsaved changes?')) return;
+		const op = docScope.begin();
+		const versionAtStart = contentVersion;
+		errorMsg = '';
+		try {
+			const doc = await api.getDoc(path, op.signal);
+			if (!docScope.isCurrent(op.id)) return;
+			if (dirty && contentVersion !== versionAtStart) {
+				errorMsg =
+					'The document changed while it was loading, so it was not replaced. Save or discard your edits first.';
+				return;
+			}
 			selected = path;
 			content = doc.content;
 			hash = doc.hash;
 			dirty = false;
+			contentVersion += 1;
 			editorKey += 1;
 			errorMsg = '';
 			searchMode = false;
+			backlinks = [];
+			outlinks = [];
+			saveQueued = false;
 			replaceState(`?path=${encodeURIComponent(path)}`, {});
-			const connections = await api.backlinks(path);
-			backlinks = connections.backlinks;
-			outlinks = connections.links;
+			schedulePreview(true);
+			await loadLinks(path, op.id);
 		} catch (err) {
+			if (isAbortError(err) || !docScope.isCurrent(op.id)) return;
+			if (isUnauthorized(err)) {
+				await goto('/login');
+				return;
+			}
 			errorMsg = message(err);
 		}
 	}
 
 	async function save() {
 		if (!selected || !dirty) return;
+		if (saving) {
+			saveQueued = true;
+			return;
+		}
+		const path = selected;
+		const submitted = content;
+		const baseHash = hash;
+		const version = contentVersion;
 		saving = true;
 		errorMsg = '';
 		try {
-			const res = await api.saveDoc({ path: selected, content, base_hash: hash });
-			hash = res.hash;
-			dirty = false;
-			statusMsg = 'Saved';
-			setTimeout(() => (statusMsg = ''), 1500);
-			await refresh();
-			const connections = await api.backlinks(selected);
-			backlinks = connections.backlinks;
-			outlinks = connections.links;
+			const res = await api.saveDoc({ path, content: submitted, base_hash: baseHash });
+			if (selected === path) {
+				hash = res.hash;
+				// Only clear dirty when the editor still holds exactly what was sent.
+				dirty = content !== submitted || contentVersion !== version;
+			}
+			flash('Saved');
+			try {
+				await refresh();
+			} catch (err) {
+				if (isUnauthorized(err)) {
+					await goto('/login');
+					return;
+				}
+			}
+			if (selected === path) await loadLinks(path, docScope.current);
 		} catch (err) {
-			errorMsg = message(err);
+			if (isUnauthorized(err)) {
+				await goto('/login');
+				return;
+			}
+			if (selected === path) errorMsg = message(err);
 		} finally {
 			saving = false;
+			if (saveQueued) {
+				saveQueued = false;
+				if (selected === path && dirty) void save();
+			}
 		}
 	}
 
 	async function createDoc() {
 		const raw = newPath.trim();
 		if (!raw) return;
+		if (dirty && !confirm('Discard unsaved changes?')) return;
 		const path = raw.endsWith('.md') ? raw : `${raw}.md`;
 		const title = path.split('/').pop()?.replace(/\.md$/, '') ?? 'Untitled';
 		try {
@@ -134,40 +318,79 @@
 			newPath = '';
 			showNew = false;
 			await refresh();
-			await openDoc(path);
+			dirty = false;
+			await openDoc(path, { force: true });
 		} catch (err) {
+			if (isUnauthorized(err)) {
+				await goto('/login');
+				return;
+			}
 			errorMsg = message(err);
 		}
 	}
 
 	async function renameDoc() {
-		if (!selected) return;
-		const next = prompt('New path', selected);
-		if (!next || next === selected) return;
+		if (!selected || saving) return;
+		const currentPath = selected;
+		const next = prompt('New path', currentPath);
+		if (!next || next === currentPath) return;
+
+		// Never silently drop edits: persist the current in-memory content first.
+		if (dirty) {
+			if (!confirm('Save your changes before renaming?')) return;
+			await save();
+			if (dirty) {
+				errorMsg =
+					'Rename cancelled because the save did not complete. Your unsaved changes are still here.';
+				return;
+			}
+		}
+
 		try {
-			const res = await api.renameDoc(selected, next);
-			dirty = false;
+			const res = await api.renameDoc(currentPath, next);
+			if (selected !== currentPath) return;
 			await refresh();
-			await openDoc(res.path);
+			await openDoc(res.path, { force: true });
 		} catch (err) {
+			if (isUnauthorized(err)) {
+				await goto('/login');
+				return;
+			}
 			errorMsg = message(err);
 		}
 	}
 
 	async function deleteDoc() {
 		if (!selected) return;
-		if (!confirm(`Delete ${selected}? This removes the file from disk.`)) return;
+		const path = selected;
+		const warning = dirty ? ' Unsaved edits will be discarded.' : '';
+		if (!confirm(`Delete ${path}? This removes the file from disk.${warning}`)) return;
+
+		// Invalidate any older open/save continuation for this document.
+		const op = docScope.begin();
+		linkScope.invalidate();
 		try {
-			await api.deleteDoc(selected);
-			selected = null;
-			content = '';
-			hash = '';
-			dirty = false;
-			backlinks = [];
-			outlinks = [];
-			replaceState('', {});
+			await api.deleteDoc(path);
+			if (selected === path) {
+				docScope.invalidate();
+				selected = null;
+				content = '';
+				hash = '';
+				dirty = false;
+				saveQueued = false;
+				contentVersion += 1;
+				backlinks = [];
+				outlinks = [];
+				previewHtml = '';
+				replaceState('/vault', {});
+			}
 			await refresh();
 		} catch (err) {
+			if (!docScope.isCurrent(op.id)) return;
+			if (isUnauthorized(err)) {
+				await goto('/login');
+				return;
+			}
 			errorMsg = message(err);
 		}
 	}
@@ -176,19 +399,25 @@
 		const q = query.trim();
 		errorMsg = '';
 		if (!q) {
-			results = [];
-			searchMode = false;
+			clearSearch();
 			return;
 		}
+		const op = searchScope.begin();
 		searching = true;
 		searchMode = true;
 		try {
-			const res = await api.search(q);
+			const res = await api.search(q, op.signal);
+			if (!searchScope.isCurrent(op.id)) return;
 			results = res.results;
 		} catch (err) {
+			if (isAbortError(err) || !searchScope.isCurrent(op.id)) return;
+			if (isUnauthorized(err)) {
+				await goto('/login');
+				return;
+			}
 			errorMsg = message(err);
 		} finally {
-			searching = false;
+			if (searchScope.isCurrent(op.id)) searching = false;
 		}
 	}
 
@@ -196,39 +425,27 @@
 		query = '';
 		results = [];
 		searchMode = false;
+		searching = false;
+		searchScope.invalidate();
 	}
 
 	function resolveWikiTarget(target: string): string | null {
-		const wanted = target.trim();
+		const wanted = normalizeWikiTarget(target);
 		if (!wanted) return null;
-		const withExt = wanted.endsWith('.md') ? wanted : `${wanted}.md`;
-		const lower = withExt.toLowerCase();
+		const lower = wanted.toLowerCase();
 		const exact = docs.find((d) => d.path.toLowerCase() === lower);
 		if (exact) return exact.path;
-		const byName = docs.find(
-			(d) => d.path.toLowerCase() === lower || d.path.toLowerCase().endsWith(`/${lower}`)
-		);
+		const byName = docs.find((d) => d.path.toLowerCase().endsWith(`/${lower}`));
 		return byName ? byName.path : null;
 	}
 
 	function openWiki(target: string) {
 		const path = resolveWikiTarget(target);
 		if (path) {
-			openDoc(path);
+			void openDoc(path);
 		} else {
 			errorMsg = `No document named "${target}"`;
 		}
-	}
-
-	function renderMarkdown(md: string): string {
-		const linked = md.replace(
-			/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g,
-			(_match, target: string, alias: string | undefined) => {
-				const label = (alias || target).trim();
-				return `<a href="#" class="wikilink" data-wiki="${encodeURIComponent(target.trim())}">${label}</a>`;
-			}
-		);
-		return marked.parse(linked, { async: false }) as string;
 	}
 
 	function onPreviewClick(event: MouseEvent) {
@@ -238,12 +455,72 @@
 		openWiki(decodeURIComponent(anchor.dataset.wiki || ''));
 	}
 
+	function snippetHtml(snippet: string): string {
+		return sanitizeSnippet(snippet);
+	}
+
 	async function logout() {
+		if (loggingOut) return;
+		loggingOut = true;
+		errorMsg = '';
+		abortAgent();
 		try {
 			await api.logout();
+			await goto('/login');
+		} catch (err) {
+			errorMsg = `Sign out failed: ${message(err)}. You are still signed in on this device; retry when the server is reachable.`;
 		} finally {
-			goto('/login');
+			loggingOut = false;
 		}
+	}
+
+	function trimAgentHistory(messages: typeof agentMessages): typeof agentMessages {
+		if (messages.length <= MAX_AGENT_MESSAGES) return messages;
+		return messages.slice(messages.length - MAX_AGENT_MESSAGES);
+	}
+
+	function flushAgent() {
+		if (agentFlushHandle !== null) {
+			cancelAnimationFrame(agentFlushHandle);
+			agentFlushHandle = null;
+		}
+		if (!agentPending) return;
+		const append = agentPending;
+		agentPending = '';
+		agentMessages = trimAgentHistory(
+			agentMessages.map((entry) =>
+				entry.id === agentAssistantId
+					? { ...entry, content: entry.content + append }
+					: entry
+			)
+		);
+	}
+
+	function scheduleAgentFlush() {
+		if (agentFlushHandle !== null) return;
+		agentFlushHandle = requestAnimationFrame(() => {
+			agentFlushHandle = null;
+			flushAgent();
+		});
+	}
+
+	function abortAgent() {
+		agentRun += 1;
+		agentAbort?.abort();
+		agentAbort = null;
+		flushAgent();
+		agentPending = '';
+		if (agentFlushHandle !== null) {
+			cancelAnimationFrame(agentFlushHandle);
+			agentFlushHandle = null;
+		}
+		agentBusy = false;
+	}
+
+	function stopAgent() {
+		if (!agentBusy) return;
+		abortAgent();
+		agentError = 'Stopped.';
 	}
 
 	async function sendAgent() {
@@ -251,21 +528,30 @@
 		if (!userMessage || agentBusy) return;
 		agentInput = '';
 		agentError = '';
+		const run = ++agentRun;
+		const abort = new AbortController();
+		agentAbort = abort;
 		agentBusy = true;
-		agentMessages = [
+		const assistantId = ++msgSeq;
+		agentAssistantId = assistantId;
+		agentMessages = trimAgentHistory([
 			...agentMessages,
 			{ id: ++msgSeq, role: 'user', content: userMessage },
-			{ id: ++msgSeq, role: 'assistant', content: '' }
-		];
-		const index = agentMessages.length - 1;
+			{ id: assistantId, role: 'assistant', content: '' }
+		]);
 
 		try {
 			const res = await fetch('/api/agent/chat', {
 				method: 'POST',
 				credentials: 'include',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ message: userMessage, path: selected })
+				body: JSON.stringify({ message: userMessage, path: selected }),
+				signal: abort.signal
 			});
+			if (res.status === 401) {
+				await goto('/login');
+				return;
+			}
 			if (!res.ok) {
 				const data = await res.json().catch(() => ({}));
 				throw new Error(data.error || `${res.status} ${res.statusText}`);
@@ -278,7 +564,12 @@
 			while (true) {
 				const { done, value } = await reader.read();
 				if (done) break;
+				if (run !== agentRun || abort.signal.aborted) {
+					await reader.cancel().catch(() => undefined);
+					break;
+				}
 				buffer += decoder.decode(value, { stream: true });
+				buffer = buffer.replace(/\r\n/g, '\n');
 				let cut: number;
 				while ((cut = buffer.indexOf('\n\n')) !== -1) {
 					const frame = buffer.slice(0, cut);
@@ -293,18 +584,30 @@
 					if (event === 'error') {
 						agentError = data;
 					} else if (event === 'done') {
-						/* finished */
+						flushAgent();
 					} else if (data) {
-						agentMessages = agentMessages.map((m, i) =>
-							i === index ? { ...m, content: m.content + data } : m
-						);
+						agentPending += data;
+						scheduleAgentFlush();
 					}
 				}
 			}
+			flushAgent();
 		} catch (err) {
-			agentError = message(err);
+			if (!abort.signal.aborted && run === agentRun) agentError = message(err);
 		} finally {
-			agentBusy = false;
+			if (run === agentRun) {
+				flushAgent();
+				agentBusy = false;
+				if (agentAbort === abort) agentAbort = null;
+			}
+		}
+	}
+
+	async function toggleSplit() {
+		split = !split;
+		if (split) {
+			await tick();
+			schedulePreview(true);
 		}
 	}
 </script>
@@ -325,12 +628,23 @@
 				<span>{user.username}</span>
 			</div>
 		{/if}
-		<button class="btn ghost" on:click={() => goto('/drive')}>Files</button>
+		<button class="btn ghost" on:click={() => goto('/drive')} disabled={loggingOut}>Files</button>
 		{#if user?.role === 'admin'}
-			<button class="btn ghost" on:click={() => goto('/settings')}>Settings</button>
+			<button class="btn ghost" on:click={() => goto('/settings')} disabled={loggingOut}>Settings</button>
 		{/if}
-		<button class="btn ghost" on:click={logout}>Sign out</button>
+		<button class="btn ghost" on:click={logout} disabled={loggingOut}>
+			{loggingOut ? 'Signing out…' : 'Sign out'}
+		</button>
 	</header>
+
+	{#if initError}
+		<div class="init-error">
+			<div class="banner">{initError}</div>
+			<button class="btn primary" on:click={init} disabled={initBusy}>
+				{initBusy ? 'Retrying…' : 'Retry'}
+			</button>
+		</div>
+	{/if}
 
 	<aside class="sidebar">
 		<div class="sidebar-head">
@@ -364,7 +678,7 @@
 						<span class="t">{result.title || result.path}</span>
 						<span class="p">{result.path}</span>
 						{#if result.snippet}
-							<div class="snip">{@html result.snippet}</div>
+							<div class="snip">{@html snippetHtml(result.snippet)}</div>
 						{/if}
 					</button>
 				{:else}
@@ -408,7 +722,10 @@
 
 	<main class="main">
 		{#if errorMsg}
-			<div class="banner" style="margin: 10px 14px 0;">{errorMsg}</div>
+			<div class="banner dismissable" style="margin: 10px 14px 0;">
+				<span>{errorMsg}</span>
+				<button class="btn ghost" on:click={() => (errorMsg = '')}>Dismiss</button>
+			</div>
 		{/if}
 
 		{#if selected}
@@ -417,13 +734,13 @@
 				{#if dirty}<span class="dot dirty" title="Unsaved changes"></span>{/if}
 				{#if statusMsg}<span class="path" style="color: var(--good)">{statusMsg}</span>{/if}
 				<div class="spacer"></div>
-				<button class="btn" class:active={split} on:click={() => (split = !split)}>
+				<button class="btn" class:active={split} on:click={toggleSplit}>
 					{split ? 'Single pane' : 'Split preview'}
 				</button>
 				<button class="btn primary" on:click={save} disabled={!dirty || saving}>
 					{saving ? 'Saving…' : 'Save'}
 				</button>
-				<button class="btn ghost" on:click={renameDoc}>Rename</button>
+				<button class="btn ghost" on:click={renameDoc} disabled={saving}>Rename</button>
 				<button class="btn danger" on:click={deleteDoc}>Delete</button>
 			</div>
 
@@ -437,8 +754,11 @@
 							onchange={(next) => {
 								content = next;
 								dirty = true;
+								contentVersion += 1;
+								schedulePreview();
 							}}
 							onsave={save}
+							onunauthorized={() => goto('/login')}
 						/>
 					{/key}
 				</div>
@@ -446,7 +766,7 @@
 					<div class="preview-pane">
 						<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 						<div class="preview" on:click={onPreviewClick}>
-							<div class="markdown-body">{@html renderMarkdown(content)}</div>
+							<div class="markdown-body">{@html previewHtml}</div>
 						</div>
 					</div>
 				{/if}
@@ -537,9 +857,13 @@
 						}
 					}}
 				></textarea>
-				<button class="btn primary" on:click={sendAgent} disabled={agentBusy || !agentInput.trim()}>
-					{agentBusy ? '…' : 'Send'}
-				</button>
+				{#if agentBusy}
+					<button class="btn" on:click={stopAgent}>Stop</button>
+				{:else}
+					<button class="btn primary" on:click={sendAgent} disabled={!agentInput.trim()}>
+						Send
+					</button>
+				{/if}
 			</div>
 		{/if}
 	</aside>

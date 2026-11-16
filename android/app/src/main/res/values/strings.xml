@@ -3,5 +3,5 @@
     <string name="app_name">Nimbo Backup</string>
     <string name="notif_channel_name">Backup status</string>
     <string name="notif_title">Nimbo Backup</string>
-    <string name="notif_text">Watching for new files on Wi-Fi</string>
+    <string name="notif_text">Watching for new files on unmetered networks</string>
 </resources>
