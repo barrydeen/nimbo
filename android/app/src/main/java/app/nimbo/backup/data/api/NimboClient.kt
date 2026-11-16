@@ -131,10 +131,9 @@ class NimboClient(baseUrl: String, private val token: String) {
     private fun buildRequest(path: String, body: RequestBody? = null, method: String = "GET"): Request {
         val builder = Request.Builder().url(root + path)
         when {
-            body == null && method == "GET" -> builder.get()
-            body == null -> builder.delete()
-            method != "POST" -> throw IllegalArgumentException("unsupported method")
-            else -> builder.post(body)
+            method == "DELETE" -> builder.delete(body)
+            body != null -> builder.post(body)
+            else -> builder.get()
         }
         return builder.build()
     }

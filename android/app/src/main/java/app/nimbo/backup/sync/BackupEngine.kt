@@ -2,6 +2,7 @@ package app.nimbo.backup.sync
 
 import android.content.Context
 import android.net.Uri
+import android.util.Log
 import androidx.documentfile.provider.DocumentFile
 import app.nimbo.backup.data.Prefs
 import app.nimbo.backup.data.api.NimboAuthException
@@ -32,6 +33,7 @@ import java.security.MessageDigest
  */
 object BackupEngine {
 
+    private const val TAG = "NimboBackup"
     private const val ROOT_PREFIX = "Phone Backups"
 
     suspend fun run(context: Context): Outcome {
@@ -45,14 +47,19 @@ object BackupEngine {
 
         for (folder in db.folderDao().enabled()) {
             try {
+                Log.d(TAG, "syncing folder ${folder.displayName} (${folder.treeUri})")
                 syncFolder(context, client, db, folder, config.deviceName)
+                Log.d(TAG, "sync finished for ${folder.displayName}")
             } catch (e: NimboAuthException) {
+                Log.e(TAG, "auth rejected for ${folder.displayName}", e)
                 prefs.markAuthFailed()
                 outcome.errors += "Server rejected the device token — re-pair in the app."
                 break
             } catch (e: IOException) {
+                Log.e(TAG, "io error for ${folder.displayName}", e)
                 outcome.errors += "${folder.displayName}: ${e.message ?: "network error"}"
             } catch (e: Exception) {
+                Log.e(TAG, "unexpected error for ${folder.displayName}", e)
                 outcome.errors += "${folder.displayName}: ${e.message ?: "unexpected error"}"
             }
         }
