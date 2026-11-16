@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Android app now browses the server as well as backing up: folder navigation,
+  authenticated image/video thumbnails, a gallery with All/Photos/Videos
+  filters, drive-wide file search, downloads to the phone and a read-only
+  Markdown vault viewer
+- `GET /api/files/media` flat image/video listing with pagination, scope
+  enforcement and `has_thumb` metadata for the Android gallery
+- ffmpeg-based video frame thumbnails in the indexing worker; the Docker runtime
+  image includes ffmpeg and source installs without it degrade gracefully
+- File search results now expose `has_thumb` so clients can show previews
 - `docs/operations.md`: offline whole-volume backup/restore, integrity and blob
   checks, restore drills, versioned upgrades, rollback, retention, log rotation
   and an operational FAQ
@@ -25,6 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Android unit-test, lint, wrapper-validation and release-signing workflow
   coverage; release builds fail closed when signing secrets are absent
 - Backup-scoped device tokens and the in-place file replacement endpoint
+- Tabbed settings page with separate Providers & models and Device tokens sections
+- Multiple OpenAI-compatible providers per instance, provider model discovery via
+  `POST /api/settings/llm/models`, and per-provider model allowlists
+- Separate document-agent and file-indexing model roles, selectable across providers
+- Legacy single-provider `llm_config` settings are upgraded automatically
+- Agentic vault assistant in the right sidebar: tool-calling vault search/read,
+  draft edit/append/replace/create proposals, reviewable diffs, Apply/Discard/
+  Open/Undo, per-document conversations, Ask/Auto/Edit intent modes and a
+  provider fallback for models without tool support
 
 ### Changed
 
@@ -70,7 +88,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - File watcher so external vault edits are reindexed without a restart
 - Semantic search with chunking, embeddings and hybrid BM25 + vector ranking
-- Agent tool calls with confirm-before-apply writes
+- Server-side agent conversations and deeper multi-step planning
 - Resumable uploads and background folder-zip jobs
 - Built-in backup scheduling and point-in-time recovery tooling
 

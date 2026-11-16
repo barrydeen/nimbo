@@ -36,7 +36,8 @@ backend/src
   files/
     mod.rs       node tree, name rules, breadcrumbs, containment, FTS upserts
     storage.rs   content-addressed blob paths, temp promotion, orphan GC
-    extract.rs   MIME sniffing, text decoding, image/EXIF/PDF/Office/audio metadata
+    extract.rs   MIME sniffing, text decoding, image/EXIF/PDF/Office/audio
+                 metadata and optional ffmpeg video frame thumbnails
     vision.rs    image downscaling/orientation and description persistence
     worker.rs    background indexing and vision queues
   routes/        setup, auth, docs, search, settings, agent, files, shares, public
@@ -67,11 +68,21 @@ frontend/src
   same request. Dangling links are re-resolved when new documents appear.
 - **Search:** FTS5 with BM25 ranking and `snippet()` highlighting. Queries are
   sanitized into prefix terms to avoid FTS syntax errors.
-- **Agent:** the user message is used to retrieve relevant documents and files
-  (FTS across names, extracted text, metadata and image descriptions), which are
-  injected as system context. The provider request is streamed back to the
-  browser over SSE. Inline editor actions (next-line completion, grammar, rewrite,
-  links, tags) use the same provider client without tools.
+- **Agent:** the document-agent model runs a bounded tool-calling loop over the
+  vault. Read-only tools list/search/read documents and search files; draft tools
+  (`propose_edit`, `append_to_document`, `replace_document`, `create_document`)
+  validate exact anchors against the authoritative editor buffer or on-disk note
+  and emit reviewable draft events. Draft tools never write: the browser applies
+  accepted diffs through the normal optimistic-concurrency save endpoint, so 409
+  conflicts and native editor undo still work. The assistant receives the current
+  buffer, selection, backlinks, vault index, pending draft status and relevant FTS
+  hits as bounded context. Streaming SSE carries text, tool-step and draft events;
+  providers without tool support fall back to a tagged `nimbo-draft` JSON fence.
+  The loop caps rounds, tool calls, drafts, context and total runtime. Inline
+  editor actions (next-line completion, grammar, rewrite, links, tags) use the
+  same document-agent provider client without tools. Providers and model roles are
+  configured separately in Settings; role model references are validated against
+  each provider's selected model allowlist.
 - **File uploads:** multipart chunks are streamed to a temp file while hashing.
   The completed blob is promoted into the content-addressed store, and a node row
   is inserted with a sibling-unique name in a lifecycle transaction. Duplicate
@@ -81,14 +92,24 @@ frontend/src
   existing file node while preserving its identity and name.
 - **File indexing:** a background worker claims `index_status='pending'` rows,
   extracts text/metadata/thumbnails in a blocking task, stores the thumbnail as
-  another blob, and refreshes the file's FTS row. Parsing applies byte, entry,
-  pixel and expansion caps before dispatch and each job has a five-minute
-  deadline, but native parser work may continue after a deadline; container
-  limits remain the hard backstop.
+  another blob, and refreshes the file's FTS row. Images are decoded in-process;
+  videos use the optional `ffmpeg` binary to extract one bounded JPEG frame with
+  its own CPU/address-space limits. Parsing applies byte, entry, pixel and
+  expansion caps before dispatch and each job has a five-minute deadline, but
+  native parser work may continue after a deadline; container limits remain the
+  hard backstop.
+- **Remote browsing:** `GET /api/files/media` returns a flat, paginated,
+  newest-first image/video listing scoped like every other file query. The
+  Android app uses it for the gallery, `GET /api/files/search` for drive-wide
+  search, and the read-only `/api/docs/tree` + `/api/docs/content` routes for
+  the vault. Authenticated thumbnails, inline image content and downloads all
+  carry the device token; no public share link is created for the app.
 - **Image descriptions:** images with `vision_status='pending'` are downscaled
-  (EXIF orientation applied), sent to the configured vision model, and stored as
-  description, visible text and tags. Missing providers mark images `skipped`;
-  saving LLM settings requeues skipped images. Failures require a manual retry.
+  (EXIF orientation applied), sent to the model assigned to the file-indexing role
+  (falling back to the document-agent model when no indexing model is set), and
+  stored as description, visible text and tags. Missing providers mark images
+  `skipped`; saving LLM settings requeues skipped images. Failures require a
+  manual retry.
 - **Shares:** share IDs are 256-bit random tokens. Public endpoints resolve the
   token, reject revoked/expired links with 410, and verify every requested node is
   the shared file or inside the shared folder. Folder zips are built in a temp
@@ -111,8 +132,11 @@ frontend/src
 - Path traversal is prevented lexically (`..`, absolute paths, non-`.md`) and
   files are always joined under the vault root, with descriptor-relative checks
   for final and parent symlinks.
-- The agent is given read-only vault and file context in this version; write
-  actions are user-initiated from the UI.
+- Agent tools are read-only except for draft proposals. Draft proposals are
+  validated but never persisted by the agent; only an explicit Apply in the UI
+  saves through the normal document endpoint with `base_hash` concurrency checks.
+  Vault and file content is delimited as untrusted context, not instructions, and
+  the tool loop is bounded in rounds, calls, context, drafts and wall-clock time.
 - Public share responses expose only names, sizes, types and preview/download
   URLs. Extracted text, EXIF/GPS, document metadata and AI descriptions are
   available only to authenticated users.

@@ -13,9 +13,10 @@ automatic image descriptions.
 > Status: early but usable. Auth, first-run setup with an optional bootstrap
 > token, document CRUD, wikilinks, sanitized previews, full-text search, the
 > files module (folders, uploads, previews, metadata and vision extraction,
-> public share links), device tokens with optional backup scope, LLM provider
-> settings and an agent layer (vault-grounded chat plus inline writing actions)
-> are implemented. A companion Android backup app lives in `android/`.
+> public share links), device tokens with optional backup scope, multi-provider
+> LLM settings and an agent layer (vault-grounded chat plus inline writing actions)
+> are implemented. A companion Android app provides backups, file browsing,
+> a media gallery, search and a read-only vault viewer in `android/`.
 
 Nimbo encrypts provider API keys at rest. Notes, database rows, uploaded blobs
 and backups are **not** application-encrypted; see [data at rest](#security-notes)
@@ -32,21 +33,31 @@ and the [operations runbook](docs/operations.md).
 - Full-text search over the vault with ranked snippets (SQLite FTS5/BM25)
 - Obsidian-style editor: CodeMirror source view, side-by-side live preview,
   markdown formatting toolbar, wikilink autocomplete, sanitized HTML and URLs
-- Agent: connect any OpenAI-compatible provider (OpenAI, Ollama, LM Studio, vLLM,
-  OpenRouter); API keys encrypted at rest
+- Agent: connect one or more OpenAI-compatible providers (OpenAI, Ollama, LM Studio,
+  vLLM, OpenRouter); API keys encrypted at rest
+- Provider settings discover models through `/models`, let you select which models
+  Nimbo may use, and assign separate models for the document agent and file indexing
 - Vault-grounded streaming chat that retrieves relevant documents before answering
+- Tool-calling vault assistant in the right sidebar: search/read documents and
+  files, then propose edit, append, replace or create drafts as reviewable diffs
+- Human-in-the-loop drafts: Apply, Discard, Open and Undo; nothing is written
+  until the user accepts, and saves still use optimistic concurrency
+- Per-document conversations with streaming tool steps, Ask/Auto/Edit modes and
+  a read-only fallback protocol for providers without tool support
 - Inline editor actions: Tab-accepted next-line suggestions (toggleable), grammar,
   rewrite, link suggestions and tags
 - Files drive: folders, drag-and-drop uploads, streaming downloads with byte
   ranges, grid/list browsing, recent files and search
-- Metadata and content extraction for images (dimensions, EXIF, thumbnails), PDFs
-  (document info + text), Office/ODF/EPUB documents, audio tags, and text/code
-- Automatic image descriptions (description, visible text, tags) through any
-  OpenAI-compatible vision model
+- Metadata and content extraction for images (dimensions, EXIF, thumbnails) and
+  videos (ffmpeg frame thumbnails when installed), PDFs (document info + text),
+  Office/ODF/EPUB documents, audio tags, and text/code
+- Automatic image descriptions (description, visible text, tags) through a
+  vision-capable model assigned to file indexing
 - Revocable, optionally expiring public share links for files and folders, with
   folder zip downloads
-- Device tokens with full or backup scope; the Android app uses a token confined
-  to its `Phone Backups` subtree
+- Device tokens with full or backup scope; full-scope tokens can browse the
+  drive, gallery and read-only vault, while backup tokens are confined to the
+  `Phone Backups` subtree
 - Single-container Docker deployment with a persistent `/data` volume, a
   loopback-only default, resource limits, health checks and log rotation
 - Versioned container images published to GHCR on release tags, plus a
@@ -55,8 +66,9 @@ and the [operations runbook](docs/operations.md).
 - Digest-pinned container bases and full-commit-SHA GitHub Actions references
 - CI Android release workflow that produces no release APK when signing secrets
   are absent, instead of falling back to a debug key
-- Companion Android backup app that mirrors phone folders to the drive over a
-  device token (see [`android/README.md`](android/README.md))
+- Companion Android app for folder backups plus remote browsing, authenticated
+  thumbnails, gallery, file search, downloads and a read-only Markdown vault
+  viewer (see [`android/README.md`](android/README.md))
 
 ## Quick start (Docker)
 
@@ -153,20 +165,25 @@ npm run dev
 Then open the Vite URL (typically <http://localhost:5173>). Local development
 uses HTTP; do not expose that listener beyond your machine.
 
-## Android backup app
+## Android app
 
 The `android/` directory contains a native Kotlin/Jetpack Compose companion app
-that mirrors selected phone folders to the Nimbo drive. It is built separately
-with Gradle; see [`android/README.md`](android/README.md) for setup, signing and
-the device-token flow.
+that mirrors selected phone folders to the Nimbo drive and also lets you browse
+the server: folder navigation, authenticated image/video thumbnails, a gallery,
+file search, downloads, and a read-only Markdown vault viewer. It is built
+separately with Gradle; see [`android/README.md`](android/README.md) for setup,
+signing and the device-token flow.
 
 - Use **HTTPS**. Plain HTTP requires an explicit insecure-allow setting in the
   app, sends the device credential in cleartext, and is not recommended.
-- Prefer a **backup-scoped** device token. It is bound to the `Phone Backups`
-  subtree and cannot read documents, change settings, manage shares or create
-  more tokens. A full-scope token has the same access as the account.
+- Use a **full-scope** device token to browse the whole drive, gallery, search
+  and vault. A **backup-scoped** token is safer for a phone that only backs up:
+  it is bound to the `Phone Backups` subtree and cannot read documents, search
+  the vault, change settings, manage shares or create more tokens.
 - The automatic work constraint is **unmetered**, not "a specific Wi-Fi
   network". Test & Save is a direct request and ignores that constraint.
+- Video thumbnails require `ffmpeg` on the server. The Docker image includes it;
+  a source install without ffmpeg still browses videos but shows a placeholder.
 - Android's Storage Access Framework restricts some directories; not every
   folder on the device can be selected.
 
@@ -220,8 +237,9 @@ are in [`docs/operations.md`](docs/operations.md#configuration-reference).
   them in the drive UI.
 - Device tokens are 256-bit random `nmb_…` values. Only their SHA-256 hashes are
   stored, they can be revoked at any time, and the raw value is shown once.
-  Full-scope tokens grant the creator's access; prefer backup scope for the
-  Android app. Treat both like passwords.
+  Full-scope tokens grant the creator's access, including the vault; use a
+  backup-scope token when the app only needs to back up. Treat both like
+  passwords.
 - Markdown preview and search snippets are rendered through a maintained
   sanitizer with an explicit URL policy; raw HTML and event handlers are not
   trusted. Inline previews are limited to safe raster images, PDF, audio, video
@@ -230,9 +248,9 @@ are in [`docs/operations.md`](docs/operations.md#configuration-reference).
   database rows, blobs and backups are plaintext. Use host/filesystem
   encryption and protected backup storage if disk theft or backup exposure is
   in scope.
-- When image descriptions are enabled, image bytes are sent to the configured
-  LLM provider. Disable automatic descriptions in Settings for fully local-only
-  storage.
+- When image descriptions are enabled, image bytes are sent to the provider
+  assigned to file indexing. Disable automatic descriptions in Settings for
+  fully local-only storage.
 
 ## API
 
@@ -257,8 +275,9 @@ DELETE /api/docs/content?path=  delete a document
 POST /api/docs/rename           move a document
 GET  /api/docs/backlinks?path=  backlinks and outgoing links
 GET  /api/search?q=             full-text search
-GET  /api/settings/llm          provider settings (masked)
-PUT  /api/settings/llm          save provider (admin only)
+GET  /api/settings/llm          provider and model-role settings (masked)
+PUT  /api/settings/llm          save providers and model roles (admin only)
+POST /api/settings/llm/models   discover provider models (admin only)
 POST /api/settings/llm/test     connectivity check (admin only)
 POST /api/agent/chat            streaming vault-grounded chat (SSE)
 POST /api/agent/action          inline writing actions
@@ -267,6 +286,7 @@ GET  /api/files?folder_id=      list a folder (root default; offset/limit, next_
 POST /api/files/folders         create a folder
 POST /api/files/upload?folder_id= multipart upload (one or more `file` fields)
 GET  /api/files/recent          recently updated files
+GET  /api/files/media?kind=     flat image/video listing for the gallery (image, video or all)
 GET  /api/files/search?q=       search names, text, metadata and descriptions
 GET  /api/files/stats           storage and share counters
 GET  /api/files/{id}            file details, metadata, vision state and shares
@@ -300,8 +320,8 @@ authorization error.
 
 1. File watcher so external edits are reindexed without a restart.
 2. Semantic search: chunking, embeddings, hybrid BM25 + vector ranking.
-3. Agent tool calls (search/read/write documents and files) with
-   confirm-before-apply.
+3. Server-side agent conversations so chats and drafts survive devices, with
+   deeper multi-step planning and optional scheduled vault maintenance.
 4. Resumable/chunked uploads and background zip jobs for very large folders.
 5. Built-in backup scheduling and point-in-time recovery tooling.
 
@@ -312,6 +332,8 @@ authorization error.
   retention, logs and FAQ
 - [`docs/architecture.md`](docs/architecture.md) - components, data flow, threat
   model and known limitations
+- [`docs/agent.md`](docs/agent.md) - assistant tools, draft lifecycle, streaming
+  protocol, provider fallback and safety rules
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) - development setup, checks and PR process
 - [`SECURITY.md`](SECURITY.md) - reporting vulnerabilities and deployment
   hardening

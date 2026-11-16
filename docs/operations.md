@@ -25,7 +25,10 @@ offline backup is a prerequisite for every upgrade.
 Resource expectations for a small personal instance: 2 vCPU, 2 GiB RAM,
 10 GiB free disk plus the size of your files. Image extraction and the vision
 worker can be memory hungry; the container limits are a backstop, not a
-guarantee that a hostile parser will be killed quickly.
+guarantee that a hostile parser will be killed quickly. The published image
+includes `ffmpeg` for video frame thumbnails. A source install without `ffmpeg`
+still indexes videos but shows placeholders in galleries; install it on `PATH`
+to enable video thumbnails.
 
 ## First run and bootstrap
 
@@ -700,6 +703,12 @@ raise `NIMBO_MAX_UPLOAD_MB` and `NIMBO_PROXY_BODY_LIMIT` together.
 Disable proxy buffering (`proxy_buffering off`) and use HTTP/1.1 or HTTP/2
 without response compression at the proxy. Nimbo streams SSE; a buffering
 proxy hides deltas until the response ends.
+
+**The assistant answers but never proposes edits.**
+The document-agent model may not support tool calling. Choose a tool-capable
+model in Settings, switch the composer to `Edit` mode, or rely on the
+`nimbo-draft` fallback (less precise retrieval). Check the sidebar tool steps:
+a provider that rejects tools is retried without them automatically.
 
 **A public folder ZIP takes a long time or fails.**
 Archives are built synchronously before the response starts. Each archive is
