@@ -1,5 +1,6 @@
 package app.nimbo.backup.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,12 +18,16 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Logout
+import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
@@ -32,6 +37,8 @@ import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -57,9 +64,11 @@ import androidx.compose.ui.unit.dp
 import java.util.Locale
 
 @Composable
-fun BackupApp(
+fun NimboApp(
     state: UiState,
-    actions: BackupActions,
+    browse: BrowseState,
+    tab: MainTab,
+    actions: AppActions,
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
     LaunchedEffect(state.snackbar) {
@@ -69,32 +78,33 @@ fun BackupApp(
         }
     }
 
-    Scaffold(
-        topBar = {
-            if (state.configured) {
-                FolderTopBar(state, actions)
-            }
-        },
-        floatingActionButton = {
-            if (state.configured) {
-                FloatingActionButton(onClick = { actions.onAddFolder() }) {
-                    Icon(Icons.Default.Add, contentDescription = "Add folder")
-                }
-            }
-        },
-        snackbarHost = {
-            SnackbarHost(snackbarHostState) { data ->
-                Snackbar(snackbarData = data)
-            }
-        },
-    ) { padding ->
+    val filesCanGoUp = tab == MainTab.Files && browse.files.folderId.isNotBlank()
+    BackHandler(
+        enabled = browse.docViewer != null ||
+            browse.imageViewer != null ||
+            filesCanGoUp ||
+            tab != MainTab.Backups,
+    ) {
         when {
-            state.loading -> Box(
-                modifier = Modifier.fillMaxSize().padding(padding),
-                contentAlignment = Alignment.Center,
-            ) { CircularProgressIndicator() }
+            browse.docViewer != null -> actions.onCloseDoc()
+            browse.imageViewer != null -> actions.onCloseImageViewer()
+            filesCanGoUp -> actions.onGoToParent()
+            tab != MainTab.Backups -> actions.onSelectTab(MainTab.Backups)
+        }
+    }
 
-            !state.configured -> SetupScreen(
+    if (state.loading) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator()
+        }
+        return
+    }
+
+    if (!state.configured) {
+        Scaffold(
+            snackbarHost = { SnackbarHost(snackbarHostState) { Snackbar(snackbarData = it) } },
+        ) { padding ->
+            SetupScreen(
                 Modifier.padding(padding),
                 initialUrl = state.serverUrl,
                 initialDeviceName = state.deviceName.ifBlank { defaultDeviceName() },
@@ -103,13 +113,64 @@ fun BackupApp(
                 },
                 onScanQr = { actions.onScanQr() },
             )
+        }
+        return
+    }
 
-            else -> FolderScreen(Modifier.padding(padding), state, actions)
+    Box(Modifier.fillMaxSize()) {
+        Scaffold(
+            topBar = { NimboTopBar(state, browse, tab, actions) },
+            bottomBar = {
+                NavigationBar {
+                    MainTab.entries.forEach { entry ->
+                        NavigationBarItem(
+                            selected = tab == entry,
+                            onClick = { actions.onSelectTab(entry) },
+                            icon = { Icon(tabIcon(entry), contentDescription = entry.label) },
+                            label = { Text(entry.label) },
+                        )
+                    }
+                }
+            },
+            floatingActionButton = {
+                if (tab == MainTab.Backups) {
+                    FloatingActionButton(onClick = { actions.onAddFolder() }) {
+                        Icon(Icons.Default.Add, contentDescription = "Add folder")
+                    }
+                }
+            },
+            snackbarHost = { SnackbarHost(snackbarHostState) { Snackbar(snackbarData = it) } },
+        ) { padding ->
+            when (tab) {
+                MainTab.Backups -> FolderScreen(Modifier.padding(padding), state, actions)
+                MainTab.Files -> FilesScreen(
+                    Modifier.padding(padding),
+                    state,
+                    browse.files,
+                    browse.downloading,
+                    actions,
+                )
+                MainTab.Gallery -> GalleryScreen(
+                    Modifier.padding(padding),
+                    browse.gallery,
+                    browse.downloading,
+                    actions,
+                )
+                MainTab.Search -> SearchScreen(Modifier.padding(padding), browse.search, actions)
+                MainTab.Vault -> VaultScreen(Modifier.padding(padding), state, browse.vault, actions)
+            }
+        }
+
+        browse.docViewer?.let { viewer ->
+            DocViewerOverlay(viewer, actions)
+        }
+        browse.imageViewer?.let { item ->
+            MediaViewerOverlay(item, browse.downloading, actions)
         }
     }
 }
 
-class BackupActions(
+class AppActions(
     val onTestAndSave: (url: String, token: String, deviceName: String, allowInsecureHttp: Boolean, testNow: Boolean) -> Unit,
     val onAddFolder: () -> Unit,
     val onToggleFolder: (id: Long, enabled: Boolean) -> Unit,
@@ -121,28 +182,88 @@ class BackupActions(
     val onDismissObserverError: () -> Unit,
     val onSnackbarConsumed: () -> Unit,
     val onScanQr: () -> Unit,
+    val onSelectTab: (MainTab) -> Unit,
+    val onRefreshFiles: () -> Unit,
+    val onOpenFolder: (String) -> Unit,
+    val onGoToParent: () -> Unit,
+    val onOpenItem: (app.nimbo.backup.data.api.NodeSummary) -> Unit,
+    val onDownload: (app.nimbo.backup.data.api.NodeSummary) -> Unit,
+    val onSetMediaFilter: (MediaFilter) -> Unit,
+    val onLoadGallery: (Boolean) -> Unit,
+    val onSearch: (String) -> Unit,
+    val onLoadVault: (Boolean) -> Unit,
+    val onOpenDoc: (app.nimbo.backup.data.api.DocSummary) -> Unit,
+    val onCloseDoc: () -> Unit,
+    val onCloseImageViewer: () -> Unit,
+    val onThumbnail: suspend (app.nimbo.backup.data.api.NodeSummary) -> ByteArray?,
+    val onOpenImage: suspend (app.nimbo.backup.data.api.NodeSummary) -> ByteArray?,
 )
+
+private fun tabIcon(tab: MainTab) = when (tab) {
+    MainTab.Backups -> Icons.Default.CloudUpload
+    MainTab.Files -> Icons.Default.Folder
+    MainTab.Gallery -> Icons.Default.PhotoLibrary
+    MainTab.Search -> Icons.Default.Search
+    MainTab.Vault -> Icons.AutoMirrored.Filled.MenuBook
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun FolderTopBar(state: UiState, actions: BackupActions) {
+private fun NimboTopBar(
+    state: UiState,
+    browse: BrowseState,
+    tab: MainTab,
+    actions: AppActions,
+) {
+    val title = when (tab) {
+        MainTab.Backups -> "Nimbo"
+        MainTab.Files -> browse.files.folderName
+        MainTab.Gallery -> "Gallery"
+        MainTab.Search -> "Search"
+        MainTab.Vault -> "Vault"
+    }
+    val subtitle = when {
+        tab == MainTab.Backups -> state.serverUrl.substringAfter("://")
+        tab == MainTab.Files && browse.files.breadcrumbs.isNotEmpty() ->
+            browse.files.breadcrumbs.joinToString(" / ") { it.name }
+        tab == MainTab.Vault && state.backupScope == true -> "Read-only · backup token"
+        tab == MainTab.Vault -> "Read-only"
+        else -> ""
+    }
     TopAppBar(
         title = {
             Column {
-                Text("Nimbo Backup")
-                Text(
-                    state.serverUrl.substringAfter("://"),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                Text(title)
+                if (subtitle.isNotBlank()) {
+                    Text(
+                        subtitle,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                    )
+                }
             }
         },
         actions = {
-            IconButton(onClick = { actions.onBackupNow() }) {
-                Icon(Icons.Default.Refresh, contentDescription = "Backup now")
-            }
-            IconButton(onClick = { actions.onDisconnect() }) {
-                Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = "Disconnect")
+            when (tab) {
+                MainTab.Backups -> {
+                    IconButton(onClick = { actions.onBackupNow() }) {
+                        Icon(Icons.Default.Refresh, contentDescription = "Backup now")
+                    }
+                    IconButton(onClick = { actions.onDisconnect() }) {
+                        Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = "Disconnect")
+                    }
+                }
+                MainTab.Files -> IconButton(onClick = { actions.onRefreshFiles() }) {
+                    Icon(Icons.Default.Refresh, contentDescription = "Refresh files")
+                }
+                MainTab.Gallery -> IconButton(onClick = { actions.onLoadGallery(true) }) {
+                    Icon(Icons.Default.Refresh, contentDescription = "Refresh gallery")
+                }
+                MainTab.Vault -> IconButton(onClick = { actions.onLoadVault(true) }) {
+                    Icon(Icons.Default.Refresh, contentDescription = "Refresh vault")
+                }
+                MainTab.Search -> Unit
             }
         },
     )
@@ -187,7 +308,8 @@ private fun SetupScreen(
             "Scan the pairing QR code shown by Nimbo's settings (Settings → Connect phone), " +
                 "or create a device token and enter it manually. Backups run only on unmetered " +
                 "networks (Wi-Fi/Ethernet); an optional connection test below uses whatever " +
-                "network is currently active.",
+                "network is currently active. Use a full-scope token to browse the drive, " +
+                "gallery, search and read-only vault; a backup-scoped token only sees Phone Backups.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
@@ -299,7 +421,7 @@ private fun CheckRow(
 private fun FolderScreen(
     modifier: Modifier = Modifier,
     state: UiState,
-    actions: BackupActions,
+    actions: AppActions,
 ) {
     Column(modifier = modifier.fillMaxSize()) {
         if (state.authFailed) {
@@ -356,7 +478,7 @@ private fun FolderScreen(
 }
 
 @Composable
-private fun FolderCard(ui: FolderUi, actions: BackupActions) {
+private fun FolderCard(ui: FolderUi, actions: AppActions) {
     val f = ui.folder
     val counts = ui.counts
     Card(modifier = Modifier.fillMaxWidth()) {

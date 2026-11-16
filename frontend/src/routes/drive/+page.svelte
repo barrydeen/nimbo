@@ -54,6 +54,7 @@
 	let statusTimer: ReturnType<typeof setTimeout> | null = null;
 
 	let layout: 'grid' | 'list' = 'grid';
+	let failedThumbs = new Set<string>();
 	let searchQuery = '';
 	let searchResults: FileNode[] = [];
 	let searchMode = false;
@@ -253,6 +254,7 @@
 		resetRenderLimit();
 		nextOffset = null;
 		loadMoreError = '';
+		failedThumbs = new Set();
 		try {
 			const listing = await api.listFiles(id, op.signal);
 			if (!navScope.isCurrent(op.id)) return;
@@ -956,6 +958,10 @@
 		return !!mime && mime.startsWith('image/') && mime !== 'image/svg+xml';
 	}
 
+	function markThumbFailed(id: string): void {
+		failedThumbs = new Set(failedThumbs).add(id);
+	}
+
 	function isPdf(mime?: string | null): boolean {
 		return mime === 'application/pdf';
 	}
@@ -1006,6 +1012,21 @@
 		if (status === 'failed') return 'bad';
 		if (status === 'partial' || status === 'skipped') return 'warn';
 		return 'idle';
+	}
+
+	// The grid badge reflects what actually makes an item useful. For images,
+	// that is the AI description rather than the separate text index, which can
+	// still be pending after the description is ready.
+	function gridStatus(item: FileNode): string | null {
+		if (item.kind !== 'file') return null;
+		const image = isImage(item.mime);
+		const status =
+			image && item.vision_status && item.vision_status !== 'n/a'
+				? item.vision_status
+				: item.index_status;
+		if (!status || status === 'n/a') return null;
+		if (status === 'done') return image ? 'done' : null;
+		return status;
 	}
 
 	function flattenMetadata(
@@ -1354,13 +1375,19 @@
 				{:else if layout === 'grid'}
 					<div class="card-grid">
 						{#each shownItems as item (item.id)}
+							{@const status = gridStatus(item)}
 							<div class="file-card" class:selected={selectedId === item.id}>
 								<button class="card-main" on:click={() => openItem(item)} title={item.name}>
 									<span class="thumb">
 										{#if item.kind === 'folder'}
 											<span class="folder-glyph"></span>
-										{:else if isImage(item.mime) && item.has_thumb}
-											<img src={fileThumbUrl(item.id)} alt="" loading="lazy" />
+										{:else if isImage(item.mime) && !failedThumbs.has(item.id)}
+											<img
+												src={item.has_thumb ? fileThumbUrl(item.id) : fileContentUrl(item.id)}
+												alt=""
+												loading="lazy"
+												on:error={() => markThumbFailed(item.id)}
+											/>
 										{:else}
 											<span class="badge big">{extensionOf(item.name)}</span>
 										{/if}
@@ -1371,8 +1398,14 @@
 											? 'Folder'
 											: `${formatBytes(item.size)} · ${formatDate(item.updated_at)}`}
 									</span>
-									{#if item.kind === 'file' && item.index_status && item.index_status !== 'done' && item.index_status !== 'n/a'}
-										<span class="mini-status {statusClass(item.index_status)}">{statusLabel(item.index_status)}</span>
+									{#if status}
+										<span
+											class="mini-status {statusClass(status)}"
+											title={status === 'done' ? 'Ready' : statusLabel(status)}
+											aria-label={status === 'done' ? 'Ready' : statusLabel(status)}
+										>
+											{status === 'done' ? '✓' : statusLabel(status)}
+										</span>
 									{/if}
 								</button>
 								<div class="card-actions">
@@ -2022,6 +2055,27 @@
 		border-radius: 999px;
 		background: var(--panel);
 		border: 1px solid var(--line);
+	}
+	.mini-status.ok {
+		color: var(--good);
+		border-color: rgba(94, 234, 212, 0.35);
+		background: rgba(94, 234, 212, 0.1);
+		font-size: 11px;
+		font-weight: 700;
+		line-height: 1.2;
+	}
+	.mini-status.warn {
+		color: #ffd59a;
+		border-color: rgba(251, 191, 36, 0.3);
+		background: rgba(251, 191, 36, 0.08);
+	}
+	.mini-status.bad {
+		color: #ffc2cc;
+		border-color: rgba(251, 113, 133, 0.3);
+		background: rgba(251, 113, 133, 0.08);
+	}
+	.mini-status.idle {
+		color: var(--faint);
 	}
 	.card-actions {
 		position: absolute;

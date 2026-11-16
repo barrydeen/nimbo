@@ -1,0 +1,865 @@
+package app.nimbo.backup.ui
+
+import android.text.format.DateUtils
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
+import androidx.compose.material.icons.filled.AudioFile
+import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import app.nimbo.backup.data.api.DocSummary
+import app.nimbo.backup.data.api.NodeSummary
+import java.util.Locale
+
+// --------------------------------------------------------------------- files
+
+@Composable
+fun FilesScreen(
+    modifier: Modifier = Modifier,
+    state: UiState,
+    files: FilesState,
+    downloading: Set<String>,
+    actions: AppActions,
+) {
+    Column(modifier.fillMaxSize()) {
+        if (state.authFailed) {
+            InlineNotice(
+                "The server rejected the device token. Re-pair to browse files.",
+                isError = true,
+            )
+        }
+        if (state.backupScope == true && files.folderId.isBlank()) {
+            InlineNotice(
+                "This backup-scoped token only exposes the Phone Backups folder. " +
+                    "Pair a full-scope token to browse the whole drive.",
+            )
+        }
+        if (files.breadcrumbs.isNotEmpty()) {
+            BreadcrumbRow(files.breadcrumbs, actions)
+        }
+        when {
+            files.loading && files.items.isEmpty() -> CenteredProgress()
+            files.error != null && files.items.isEmpty() -> ErrorState(
+                files.error,
+                onRetry = actions.onRefreshFiles,
+            )
+            files.items.isEmpty() -> EmptyState(
+                title = "This folder is empty",
+                body = "Files uploaded in Nimbo's web drive appear here. Media thumbnails " +
+                    "are generated by the server as files are indexed.",
+            )
+            else -> LazyColumn(
+                contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 96.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                items(files.items, key = { it.id }) { item ->
+                    FileRow(item, item.id in downloading, actions)
+                }
+            }
+        }
+    }
+}
+
+private fun UiState.downloadingIds(): Set<String> = emptySet()
+
+@Composable
+private fun BreadcrumbRow(crumbs: List<CrumbUi>, actions: AppActions) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 8.dp, vertical = 2.dp),
+    ) {
+        if (crumbs.size > 1) {
+            IconButton(onClick = { actions.onGoToParent() }) {
+                Icon(Icons.Default.ArrowUpward, contentDescription = "Parent folder")
+            }
+        }
+        crumbs.forEachIndexed { index, crumb ->
+            TextButton(
+                onClick = { actions.onOpenFolder(crumb.id) },
+                enabled = index != crumbs.lastIndex,
+            ) {
+                Text(crumb.name, maxLines = 1)
+            }
+            if (index != crumbs.lastIndex) {
+                Icon(
+                    Icons.Default.ChevronRight,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun FileRow(
+    item: NodeSummary,
+    downloading: Boolean,
+    actions: AppActions,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { actions.onOpenItem(item) },
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+        ) {
+            FileLeading(item, actions)
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    item.name,
+                    style = MaterialTheme.typography.bodyLarge,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                val details = buildList {
+                    if (item.isFolder()) {
+                        add("Folder")
+                    } else {
+                        item.mime?.let { add(it) }
+                        if (item.size > 0) add(formatSize(item.size))
+                    }
+                    if (item.updated_at > 0) add(relativeTime(item.updated_at))
+                }
+                if (details.isNotEmpty()) {
+                    Text(
+                        details.joinToString(" · "),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            when {
+                downloading -> CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                item.isFolder() -> Icon(
+                    Icons.Default.ChevronRight,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                else -> IconButton(onClick = { actions.onDownload(item) }) {
+                    Icon(Icons.Default.Download, contentDescription = "Download ${item.name}")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FileLeading(item: NodeSummary, actions: AppActions, size: Dp = 44.dp) {
+    val shape = RoundedCornerShape(8.dp)
+    if (item.isMedia() && item.has_thumb) {
+        RemoteImage(
+            cacheKey = "thumb:${item.id}:${item.updated_at}",
+            load = { actions.onThumbnail(item) },
+            modifier = Modifier
+                .size(size)
+                .clip(shape),
+            contentDescription = item.name,
+            maxWidth = 320,
+            placeholder = { FileTypeIcon(item, size = 26.dp) },
+        )
+    } else {
+        Box(
+            modifier = Modifier
+                .size(size)
+                .clip(shape)
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+            contentAlignment = Alignment.Center,
+        ) {
+            FileTypeIcon(item, size = 24.dp)
+        }
+    }
+}
+
+@Composable
+private fun FileTypeIcon(item: NodeSummary, size: Dp = 26.dp) {
+    val icon = when {
+        item.isFolder() -> Icons.Default.Folder
+        item.isImage() -> Icons.Default.Image
+        item.isVideo() -> Icons.Default.Movie
+        item.mime?.startsWith("audio/") == true -> Icons.Default.AudioFile
+        item.mime == "application/pdf" -> Icons.Default.PictureAsPdf
+        item.name.endsWith(".md", ignoreCase = true) -> Icons.Default.Description
+        else -> Icons.AutoMirrored.Filled.InsertDriveFile
+    }
+    Icon(
+        icon,
+        contentDescription = null,
+        modifier = Modifier.size(size),
+        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+// ------------------------------------------------------------------- gallery
+
+@Composable
+fun GalleryScreen(
+    modifier: Modifier = Modifier,
+    gallery: GalleryState,
+    downloading: Set<String>,
+    actions: AppActions,
+) {
+    Column(modifier.fillMaxSize()) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+        ) {
+            MediaFilter.entries.forEach { filter ->
+                FilterChip(
+                    selected = gallery.filter == filter,
+                    onClick = { actions.onSetMediaFilter(filter) },
+                    label = { Text(filter.label) },
+                )
+            }
+        }
+        when {
+            gallery.loading && gallery.items.isEmpty() -> CenteredProgress()
+            gallery.error != null && gallery.items.isEmpty() -> ErrorState(
+                gallery.error,
+                onRetry = { actions.onLoadGallery(true) },
+            )
+            gallery.items.isEmpty() -> EmptyState(
+                title = "No media yet",
+                body = "Photos and videos uploaded to the drive appear here with thumbnails. " +
+                    "Existing files may need a moment while the server indexes them.",
+            )
+            else -> LazyVerticalGrid(
+                columns = GridCells.Adaptive(108.dp),
+                contentPadding = PaddingValues(12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                items(gallery.items, key = { it.id }) { item ->
+                    GalleryTile(item, item.id in downloading, actions)
+                }
+                if (gallery.nextOffset != null) {
+                    item(span = { GridItemSpan(maxLineSpan) }) {
+                        Box(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            if (gallery.loading) {
+                                CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
+                            } else {
+                                Button(onClick = { actions.onLoadGallery(false) }) {
+                                    Text("Load more")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GalleryTile(item: NodeSummary, downloading: Boolean, actions: AppActions) {
+    Column(Modifier.clickable { actions.onOpenItem(item) }) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(1f)
+                .clip(RoundedCornerShape(10.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (item.has_thumb) {
+                RemoteImage(
+                    cacheKey = "thumb:${item.id}:${item.updated_at}",
+                    load = { actions.onThumbnail(item) },
+                    modifier = Modifier.fillMaxSize(),
+                    contentDescription = item.name,
+                    maxWidth = 512,
+                    placeholder = { FileTypeIcon(item, size = 34.dp) },
+                )
+            } else {
+                FileTypeIcon(item, size = 34.dp)
+            }
+            if (item.isVideo()) {
+                Surface(
+                    color = Color.Black.copy(alpha = 0.55f),
+                    shape = RoundedCornerShape(50),
+                    modifier = Modifier.size(34.dp),
+                ) {
+                    Icon(
+                        Icons.Default.PlayArrow,
+                        contentDescription = "Video",
+                        tint = Color.White,
+                        modifier = Modifier.padding(6.dp),
+                    )
+                }
+            }
+            if (downloading) {
+                Surface(
+                    color = Color.Black.copy(alpha = 0.55f),
+                    shape = RoundedCornerShape(50),
+                    modifier = Modifier.size(34.dp),
+                ) {
+                    CircularProgressIndicator(
+                        Modifier
+                            .padding(8.dp)
+                            .fillMaxSize(),
+                        strokeWidth = 2.dp,
+                        color = Color.White,
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            item.name,
+            style = MaterialTheme.typography.labelMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+// -------------------------------------------------------------------- search
+
+@Composable
+fun SearchScreen(
+    modifier: Modifier = Modifier,
+    search: SearchState,
+    actions: AppActions,
+) {
+    Column(modifier.fillMaxSize()) {
+        OutlinedTextField(
+            value = search.query,
+            onValueChange = actions.onSearch,
+            singleLine = true,
+            label = { Text("Search files and folders") },
+            placeholder = { Text("Name, text, metadata, or image description") },
+            leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+            trailingIcon = {
+                if (search.query.isNotEmpty()) {
+                    IconButton(onClick = { actions.onSearch("") }) {
+                        Icon(Icons.Default.Clear, contentDescription = "Clear search")
+                    }
+                }
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+        )
+        when {
+            search.loading && search.results.isEmpty() -> CenteredProgress()
+            search.error != null -> ErrorState(search.error, onRetry = { actions.onSearch(search.query) })
+            !search.searched && search.query.isBlank() -> EmptyState(
+                title = "Search your drive",
+                body = "Find files by name, extracted text, metadata, or the automatic " +
+                    "description of an image.",
+            )
+            search.searched && search.results.isEmpty() -> EmptyState(
+                title = "No matches",
+                body = "Nothing matched “${search.query.trim()}”.",
+            )
+            else -> {
+                val folders = search.results.filter { it.isFolder() }
+                val files = search.results.filterNot { it.isFolder() }
+                LazyColumn(
+                    contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 96.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    if (folders.isNotEmpty()) {
+                        item { SectionLabel("Folders") }
+                        items(folders, key = { "folder:${it.id}" }) { item ->
+                            SearchRow(item, actions) {
+                                actions.onOpenFolder(item.id)
+                                actions.onSelectTab(MainTab.Files)
+                            }
+                        }
+                    }
+                    if (files.isNotEmpty()) {
+                        item { SectionLabel("Files") }
+                        items(files, key = { "file:${it.id}" }) { item ->
+                            SearchRow(item, actions) { actions.onOpenItem(item) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SectionLabel(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(top = 10.dp, bottom = 2.dp),
+    )
+}
+
+@Composable
+private fun SearchRow(item: NodeSummary, actions: AppActions, onClick: () -> Unit) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+        ) {
+            FileLeading(item, actions, size = 40.dp)
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    item.name,
+                    style = MaterialTheme.typography.bodyLarge,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (item.path.isNotBlank()) {
+                    Text(
+                        item.path,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                if (item.snippet.isNotBlank()) {
+                    Text(
+                        snippetText(item.snippet),
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                }
+            }
+            if (!item.isFolder()) {
+                IconButton(onClick = { actions.onDownload(item) }) {
+                    Icon(Icons.Default.Download, contentDescription = "Download ${item.name}")
+                }
+            } else {
+                Icon(
+                    Icons.Default.ChevronRight,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+private fun snippetText(html: String): AnnotatedString = buildAnnotatedString {
+    var cursor = 0
+    while (cursor < html.length) {
+        val open = html.indexOf("<mark>", cursor)
+        if (open < 0) {
+            append(unescapeHtml(html.substring(cursor)))
+            break
+        }
+        append(unescapeHtml(html.substring(cursor, open)))
+        val close = html.indexOf("</mark>", open + 6)
+        if (close < 0) {
+            append(unescapeHtml(html.substring(open)))
+            break
+        }
+        pushStyle(
+            SpanStyle(
+                fontWeight = FontWeight.SemiBold,
+                background = Color(0x333F51B5),
+            ),
+        )
+        append(unescapeHtml(html.substring(open + 6, close)))
+        pop()
+        cursor = close + 7
+    }
+}
+
+private fun unescapeHtml(text: String): String = text
+    .replace("&lt;", "<")
+    .replace("&gt;", ">")
+    .replace("&quot;", "\"")
+    .replace("&#39;", "'")
+    .replace("&amp;", "&")
+
+// --------------------------------------------------------------------- vault
+
+@Composable
+fun VaultScreen(
+    modifier: Modifier = Modifier,
+    state: UiState,
+    vault: VaultState,
+    actions: AppActions,
+) {
+    Column(modifier.fillMaxSize()) {
+        if (state.backupScope == true) {
+            InlineNotice(
+                "Your vault is not available to a backup-scoped token. Create a full-scope " +
+                    "device token in Nimbo Settings → Device tokens, then re-pair this app.",
+            )
+        }
+        when {
+            state.backupScope == true -> Spacer(Modifier.height(8.dp))
+            vault.loading && vault.documents.isEmpty() -> CenteredProgress()
+            vault.error != null && vault.documents.isEmpty() -> ErrorState(
+                vault.error,
+                onRetry = { actions.onLoadVault(true) },
+            )
+            vault.loaded && vault.documents.isEmpty() -> EmptyState(
+                title = "Your vault is empty",
+                body = "Markdown notes from the web vault will appear here.",
+            )
+            else -> LazyColumn(
+                contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 96.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                items(vault.documents, key = { it.path }) { document ->
+                    DocRow(document, onClick = { actions.onOpenDoc(document) })
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DocRow(document: DocSummary, onClick: () -> Unit) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp),
+        ) {
+            Box(
+                Modifier
+                    .size(40.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Default.Description,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    document.title.ifBlank { document.path.substringAfterLast('/') },
+                    style = MaterialTheme.typography.bodyLarge,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    document.path,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (document.updated_at > 0) {
+                    Text(
+                        relativeTime(document.updated_at),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            Icon(
+                Icons.Default.ChevronRight,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+// ------------------------------------------------------------------- overlays
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun DocViewerOverlay(viewer: DocViewerState, actions: AppActions) {
+    Surface(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize()) {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text(
+                            viewer.title.ifBlank {
+                                viewer.path.substringAfterLast('/')
+                            },
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            viewer.path,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                        )
+                    }
+                },
+                navigationIcon = {
+                    IconButton(onClick = { actions.onCloseDoc() }) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+            )
+            when {
+                viewer.loading -> CenteredProgress()
+                viewer.error != null -> ErrorState(viewer.error, onRetry = null)
+                viewer.content != null -> MarkdownView(
+                    viewer.content,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .verticalScroll(rememberScrollState())
+                        .padding(16.dp),
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MediaViewerOverlay(
+    item: NodeSummary,
+    downloading: Set<String>,
+    actions: AppActions,
+) {
+    Surface(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize()) {
+            TopAppBar(
+                title = {
+                    Text(item.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                },
+                navigationIcon = {
+                    IconButton(onClick = { actions.onCloseImageViewer() }) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Close")
+                    }
+                },
+                actions = {
+                    if (item.id in downloading) {
+                        CircularProgressIndicator(
+                            Modifier
+                                .padding(12.dp)
+                                .size(22.dp),
+                            strokeWidth = 2.dp,
+                        )
+                    } else {
+                        IconButton(onClick = { actions.onDownload(item) }) {
+                            Icon(Icons.Default.Download, contentDescription = "Download")
+                        }
+                    }
+                },
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black),
+                contentAlignment = Alignment.Center,
+            ) {
+                RemoteImage(
+                    cacheKey = "full:${item.id}:${item.updated_at}",
+                    load = {
+                        if (item.isImage()) actions.onOpenImage(item) else actions.onThumbnail(item)
+                    },
+                    modifier = Modifier.fillMaxSize(),
+                    contentDescription = item.name,
+                    contentScale = ContentScale.Fit,
+                    maxWidth = 2400,
+                    placeholder = {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            FileTypeIcon(item, size = 64.dp)
+                            Spacer(Modifier.height(8.dp))
+                            Text(
+                                if (item.isVideo()) {
+                                    "No thumbnail yet — download to play"
+                                } else {
+                                    "Preview unavailable"
+                                },
+                                color = Color.White,
+                                style = MaterialTheme.typography.bodyMedium,
+                                textAlign = TextAlign.Center,
+                            )
+                        }
+                    },
+                )
+                if (item.isVideo()) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(
+                            Icons.Default.PlayArrow,
+                            contentDescription = null,
+                            tint = Color.White.copy(alpha = 0.9f),
+                            modifier = Modifier.size(72.dp),
+                        )
+                        Text(
+                            "Video preview · download to play",
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelMedium,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------- shared chrome
+
+@Composable
+private fun CenteredProgress() {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        CircularProgressIndicator()
+    }
+}
+
+@Composable
+private fun ErrorState(message: String, onRetry: (() -> Unit)?) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(
+            message,
+            color = MaterialTheme.colorScheme.error,
+            textAlign = TextAlign.Center,
+        )
+        if (onRetry != null) {
+            Spacer(Modifier.height(12.dp))
+            Button(onClick = onRetry) {
+                Icon(Icons.Default.Refresh, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Try again")
+            }
+        }
+    }
+}
+
+@Composable
+private fun EmptyState(title: String, body: String) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(title, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(8.dp))
+        Text(
+            body,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
+    }
+}
+
+@Composable
+private fun InlineNotice(text: String, isError: Boolean = false) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+    ) {
+        Text(
+            text,
+            style = MaterialTheme.typography.bodySmall,
+            color = if (isError) {
+                MaterialTheme.colorScheme.error
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+            modifier = Modifier.padding(12.dp),
+        )
+    }
+}
+
+private fun relativeTime(epochSeconds: Long): String =
+    DateUtils.getRelativeTimeSpanString(epochSeconds * 1000L).toString()
+
+private fun formatSize(bytes: Long): String = when {
+    bytes >= 1L shl 30 -> String.format(Locale.US, "%.1f GB", bytes / 1073741824.0)
+    bytes >= 1L shl 20 -> String.format(Locale.US, "%.1f MB", bytes / 1048576.0)
+    bytes >= 1L shl 10 -> String.format(Locale.US, "%.1f KB", bytes / 1024.0)
+    else -> "$bytes B"
+}

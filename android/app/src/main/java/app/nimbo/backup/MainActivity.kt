@@ -8,13 +8,19 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.nimbo.backup.data.QrPayload
-import app.nimbo.backup.ui.BackupActions
-import app.nimbo.backup.ui.BackupApp
+import app.nimbo.backup.ui.AppActions
 import app.nimbo.backup.ui.BackupViewModel
+import app.nimbo.backup.ui.DownloadTarget
+import app.nimbo.backup.ui.MainTab
+import app.nimbo.backup.ui.NimboApp
 import app.nimbo.backup.ui.NimboTheme
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
@@ -22,9 +28,11 @@ import com.journeyapps.barcodescanner.ScanOptions
 class MainActivity : ComponentActivity() {
 
     private var vm: BackupViewModel? = null
+    private var pendingDownload: DownloadTarget? = null
     private lateinit var pickFolder: ActivityResultLauncher<Intent>
     private lateinit var requestNotifications: ActivityResultLauncher<String>
     private lateinit var scanQr: ActivityResultLauncher<ScanOptions>
+    private lateinit var createDocument: ActivityResultLauncher<Intent>
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -43,16 +51,46 @@ class MainActivity : ComponentActivity() {
             QrPayload.parse(payload)?.let { (url, token) -> vm?.pairFromQr(url, token) }
                 ?: run { vm?.reportBadQr() }
         }
+        createDocument = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            val target = pendingDownload
+            pendingDownload = null
+            val uri = result.data?.data
+            if (uri != null && target != null) vm?.saveDownloadTo(target, uri)
+        }
 
         setContent {
             NimboTheme {
                 val viewModel: BackupViewModel = viewModel()
                 vm = viewModel
                 val state by viewModel.state.collectAsState()
+                val browse by viewModel.browseState.collectAsState()
+                var tab by rememberSaveable { mutableStateOf(MainTab.Backups) }
 
-                BackupApp(
-                    state,
-                    BackupActions(
+                LaunchedEffect(tab, state.configured, state.backupScope) {
+                    if (!state.configured) return@LaunchedEffect
+                    when (tab) {
+                        MainTab.Files -> if (browse.files.items.isEmpty() &&
+                            !browse.files.loading &&
+                            browse.files.error == null
+                        ) {
+                            viewModel.openFolder(browse.files.folderId)
+                        }
+                        MainTab.Gallery -> if (browse.gallery.items.isEmpty() &&
+                            !browse.gallery.loading &&
+                            browse.gallery.error == null
+                        ) {
+                            viewModel.loadGallery(reset = true)
+                        }
+                        MainTab.Vault -> viewModel.loadVault()
+                        else -> Unit
+                    }
+                }
+
+                NimboApp(
+                    state = state,
+                    browse = browse,
+                    tab = tab,
+                    actions = AppActions(
                         onTestAndSave = viewModel::testAndSave,
                         onAddFolder = ::launchFolderPicker,
                         onToggleFolder = viewModel::toggleFolder,
@@ -69,6 +107,27 @@ class MainActivity : ComponentActivity() {
                         onDismissObserverError = viewModel::dismissObserverError,
                         onSnackbarConsumed = viewModel::consumeSnackbar,
                         onScanQr = ::launchQrScanner,
+                        onSelectTab = { tab = it },
+                        onRefreshFiles = viewModel::refreshFiles,
+                        onOpenFolder = viewModel::openFolder,
+                        onGoToParent = viewModel::goToParentFolder,
+                        onOpenItem = viewModel::openItem,
+                        onDownload = { item ->
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                viewModel.download(item)
+                            } else {
+                                launchCreateDocument(viewModel.downloadTarget(item))
+                            }
+                        },
+                        onSetMediaFilter = viewModel::setMediaFilter,
+                        onLoadGallery = viewModel::loadGallery,
+                        onSearch = viewModel::search,
+                        onLoadVault = viewModel::loadVault,
+                        onOpenDoc = viewModel::openDoc,
+                        onCloseDoc = viewModel::closeDoc,
+                        onCloseImageViewer = viewModel::closeImageViewer,
+                        onThumbnail = viewModel::loadThumbnail,
+                        onOpenImage = viewModel::loadFullImage,
                     ),
                 )
             }
@@ -94,5 +153,15 @@ class MainActivity : ComponentActivity() {
             )
         }
         pickFolder.launch(intent)
+    }
+
+    private fun launchCreateDocument(target: DownloadTarget) {
+        pendingDownload = target
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = target.mime ?: "application/octet-stream"
+            putExtra(Intent.EXTRA_TITLE, target.name)
+        }
+        createDocument.launch(intent)
     }
 }

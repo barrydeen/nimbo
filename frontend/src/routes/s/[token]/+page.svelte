@@ -29,6 +29,7 @@
 	let previewText = '';
 	let previewState: PreviewState = 'idle';
 	let renderLimit = 200;
+	let failedThumbs = new Set<string>();
 	let truncated = false;
 	let disposed = false;
 	const RENDER_BATCH = 200;
@@ -103,6 +104,7 @@
 		previewState = 'idle';
 		loading = true;
 		renderLimit = RENDER_BATCH;
+		failedThumbs = new Set();
 		try {
 			const result = await api.publicNodes(token, id, op.signal);
 			if (!folderScope.isCurrent(op.id)) return;
@@ -184,6 +186,10 @@
 
 	function isImage(mime?: string | null): boolean {
 		return !!mime && mime.startsWith('image/') && mime !== 'image/svg+xml';
+	}
+
+	function markThumbFailed(id: string): void {
+		failedThumbs = new Set(failedThumbs).add(id);
 	}
 
 	function isPdf(mime?: string | null): boolean {
@@ -344,8 +350,15 @@
 											<span class="thumb">
 												{#if item.kind === 'folder'}
 													<span class="folder-glyph"></span>
-												{:else if isImage(item.mime) && item.has_thumb}
-													<img src={publicThumbUrl(token, item.id)} alt="" loading="lazy" />
+												{:else if isImage(item.mime) && !failedThumbs.has(item.id)}
+													<img
+														src={item.has_thumb
+															? publicThumbUrl(token, item.id)
+															: publicContentUrl(token, item.id)}
+														alt=""
+														loading="lazy"
+														on:error={() => markThumbFailed(item.id)}
+													/>
 												{:else}
 													<span class="badge big">{extensionOf(item.name)}</span>
 												{/if}

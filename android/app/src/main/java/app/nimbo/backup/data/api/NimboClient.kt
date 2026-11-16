@@ -15,8 +15,10 @@ import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
+import java.io.OutputStream
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.TimeUnit
@@ -40,17 +42,55 @@ data class NodeSummary(
     val size: Long = 0,
     /** Trusted server-side content hash; required before adoption. */
     val sha256: String? = null,
+    val parent_id: String = "",
+    val updated_at: Long = 0,
+    val has_thumb: Boolean = false,
+    /** Full path for flat search/gallery results (empty in folder listings). */
+    val path: String = "",
+    /** Pre-escaped FTS snippet with `<mark>` highlights, when searching. */
+    val snippet: String = "",
 )
+
+@Serializable
+data class Breadcrumb(val id: String, val name: String)
 
 @Serializable
 data class FolderListing(
     val folder: FolderRef,
+    val breadcrumbs: List<Breadcrumb> = emptyList(),
     val items: List<NodeSummary> = emptyList(),
     val next_offset: Int? = null,
 ) {
     @Serializable
-    data class FolderRef(val id: String, val name: String)
+    data class FolderRef(val id: String, val name: String, val parent_id: String = "")
 }
+
+@Serializable
+data class MediaListing(
+    val items: List<NodeSummary> = emptyList(),
+    val next_offset: Int? = null,
+)
+
+@Serializable
+data class FileSearchResponse(val results: List<NodeSummary> = emptyList())
+
+@Serializable
+data class DocSummary(
+    val path: String,
+    val title: String = "",
+    val updated_at: Long = 0,
+)
+
+@Serializable
+data class DocsTreeResponse(val documents: List<DocSummary> = emptyList())
+
+@Serializable
+data class DocContent(
+    val path: String,
+    val content: String,
+    val hash: String = "",
+    val title: String = "",
+)
 
 @Serializable
 data class InstanceInfo(
@@ -135,6 +175,113 @@ class NimboClient(
         val q = "?offset=$offset&limit=$LIST_PAGE_SIZE$folderQuery"
         val resp = execute(buildRequest("/api/files$q")).requireSuccess()
         return json.decodeFromString(FolderListing.serializer(), resp.body)
+    }
+
+    /**
+     * GET /api/files/media — flat newest-first image/video listing across the
+     * accessible subtree, used by the gallery.
+     */
+    suspend fun media(kind: String?, offset: Int, limit: Int): MediaListing {
+        val kindQuery = if (kind.isNullOrBlank()) "" else "&kind=${urlEncode(kind)}"
+        val resp = execute(
+            buildRequest("/api/files/media?offset=$offset&limit=$limit$kindQuery"),
+        ).requireSuccess()
+        return json.decodeFromString(MediaListing.serializer(), resp.body)
+    }
+
+    /** GET /api/files/search — names, extracted text, metadata and descriptions. */
+    suspend fun searchFiles(query: String): List<NodeSummary> {
+        val resp = execute(
+            buildRequest("/api/files/search?q=${urlEncode(query)}"),
+        ).requireSuccess()
+        return json.decodeFromString(FileSearchResponse.serializer(), resp.body).results
+    }
+
+    /** GET /api/docs/tree — read-only vault index. Requires a full-scope token. */
+    suspend fun docsTree(): List<DocSummary> {
+        val resp = execute(buildRequest("/api/docs/tree")).requireSuccess()
+        return json.decodeFromString(DocsTreeResponse.serializer(), resp.body).documents
+    }
+
+    /** GET /api/docs/content?path= — read-only document content. */
+    suspend fun docContent(path: String): DocContent {
+        val resp = execute(
+            buildRequest("/api/docs/content?path=${urlEncode(path)}"),
+        ).requireSuccess()
+        return json.decodeFromString(DocContent.serializer(), resp.body)
+    }
+
+    /** GET /api/files/{id}/thumbnail — generated JPEG thumbnail. */
+    suspend fun thumbnail(id: String, maxBytes: Long = 4L * 1024 * 1024): ByteArray =
+        executeBytes(buildRequest("/api/files/${urlEncode(id)}/thumbnail"), maxBytes)
+
+    /** GET /api/files/{id}/content — inline bytes for an in-app image viewer. */
+    suspend fun contentBytes(id: String, maxBytes: Long = 40L * 1024 * 1024): ByteArray =
+        executeBytes(buildRequest("/api/files/${urlEncode(id)}/content"), maxBytes)
+
+    /**
+     * GET /api/files/{id}/download — streams attachment bytes into [out] without
+     * materialising the whole file in memory.
+     */
+    suspend fun downloadTo(id: String, out: OutputStream): Long = suspendCancellableCoroutine { cont ->
+        val call = http.newCall(buildRequest("/api/files/${urlEncode(id)}/download"))
+        cont.invokeOnCancellation { call.cancel() }
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                if (cont.isActive) cont.resumeWith(Result.failure(e))
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use { resp ->
+                    if (resp.code == 401) {
+                        if (cont.isActive) {
+                            cont.resumeWith(Result.failure(NimboAuthException("token rejected by server")))
+                        }
+                        return
+                    }
+                    if (resp.code !in 200..299) {
+                        val message = try {
+                            resp.body?.string().orEmpty().errorMessage()
+                        } catch (_: Exception) {
+                            "download failed"
+                        }
+                        if (cont.isActive) {
+                            cont.resumeWith(
+                                Result.failure(
+                                    NimboApiException(resp.code, message, retryAfterMs(resp.headers)),
+                                ),
+                            )
+                        }
+                        return
+                    }
+                    val body = resp.body ?: run {
+                        if (cont.isActive) {
+                            cont.resumeWith(Result.failure(NimboApiException(500, "empty download")))
+                        }
+                        return
+                    }
+                    try {
+                        body.byteStream().use { input ->
+                            val buffer = ByteArray(64 * 1024)
+                            var total = 0L
+                            while (true) {
+                                if (!cont.isActive) {
+                                    call.cancel()
+                                    return
+                                }
+                                val read = input.read(buffer)
+                                if (read < 0) break
+                                out.write(buffer, 0, read)
+                                total += read
+                            }
+                            if (cont.isActive) cont.resumeWith(Result.success(total))
+                        }
+                    } catch (e: Exception) {
+                        if (cont.isActive) cont.resumeWith(Result.failure(e))
+                    }
+                }
+            }
+        })
     }
 
     /** POST /api/files/folders — create a folder; fails 409 when the name is taken. */
@@ -245,6 +392,103 @@ class NimboClient(
             }
         })
     }
+
+    /** Bounded binary GET used for thumbnails and inline image previews. */
+    private suspend fun executeBytes(request: Request, maxBytes: Long): ByteArray =
+        suspendCancellableCoroutine { cont ->
+            val call = http.newCall(request)
+            cont.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (cont.isActive) cont.resumeWith(Result.failure(e))
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    response.use { resp ->
+                        if (resp.code == 401) {
+                            if (cont.isActive) {
+                                cont.resumeWith(
+                                    Result.failure(NimboAuthException("token rejected by server")),
+                                )
+                            }
+                            return
+                        }
+                        if (resp.code !in 200..299) {
+                            val message = try {
+                                resp.body?.string().orEmpty().errorMessage()
+                            } catch (_: Exception) {
+                                "HTTP error"
+                            }
+                            if (cont.isActive) {
+                                cont.resumeWith(
+                                    Result.failure(
+                                        NimboApiException(
+                                            resp.code,
+                                            message,
+                                            retryAfterMs(resp.headers),
+                                        ),
+                                    ),
+                                )
+                            }
+                            return
+                        }
+                        val body = resp.body ?: run {
+                            if (cont.isActive) {
+                                cont.resumeWith(
+                                    Result.failure(NimboApiException(500, "empty response")),
+                                )
+                            }
+                            return
+                        }
+                        val declared = body.contentLength()
+                        if (declared > maxBytes) {
+                            if (cont.isActive) {
+                                cont.resumeWith(
+                                    Result.failure(
+                                        NimboApiException(413, "response exceeds the preview limit"),
+                                    ),
+                                )
+                            }
+                            return
+                        }
+                        try {
+                            body.byteStream().use { input ->
+                                val initial = if (declared in 1..maxBytes) declared.toInt() else 16 * 1024
+                                val output = ByteArrayOutputStream(initial)
+                                val buffer = ByteArray(64 * 1024)
+                                var total = 0L
+                                while (true) {
+                                    if (!cont.isActive) {
+                                        call.cancel()
+                                        return
+                                    }
+                                    val read = input.read(buffer)
+                                    if (read < 0) break
+                                    total += read
+                                    if (total > maxBytes) {
+                                        if (cont.isActive) {
+                                            cont.resumeWith(
+                                                Result.failure(
+                                                    NimboApiException(
+                                                        413,
+                                                        "response exceeds the preview limit",
+                                                    ),
+                                                ),
+                                            )
+                                        }
+                                        return
+                                    }
+                                    output.write(buffer, 0, read)
+                                }
+                                if (cont.isActive) cont.resumeWith(Result.success(output.toByteArray()))
+                            }
+                        } catch (e: Exception) {
+                            if (cont.isActive) cont.resumeWith(Result.failure(e))
+                        }
+                    }
+                }
+            })
+        }
 
     private fun HttpResponse.requireSuccess(): HttpResponse {
         if (code == 401) throw NimboAuthException("token rejected by server")

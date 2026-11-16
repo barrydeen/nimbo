@@ -269,6 +269,115 @@ pub async fn recent(
 }
 
 #[derive(Deserialize)]
+pub struct MediaQuery {
+    /// `image`, `video`, or `all` (default). Aliases such as `photos` are
+    /// accepted so the Android gallery stays forgiving across versions.
+    pub kind: Option<String>,
+    pub offset: Option<u32>,
+    pub limit: Option<u32>,
+}
+
+const DEFAULT_MEDIA_LIMIT: u32 = 120;
+const MAX_MEDIA_LIMIT: u32 = 300;
+
+fn media_kind_filter(kind: Option<&str>) -> Result<&'static str, ApiError> {
+    match kind.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("all") | Some("media") => {
+            Ok("((n.mime LIKE 'image/%' AND n.mime <> 'image/svg+xml') \
+             OR n.mime LIKE 'video/%')")
+        }
+        Some("image") | Some("images") | Some("photo") | Some("photos") => {
+            Ok("(n.mime LIKE 'image/%' AND n.mime <> 'image/svg+xml')")
+        }
+        Some("video") | Some("videos") => Ok("n.mime LIKE 'video/%'"),
+        Some(other) => Err(ApiError::bad_request(format!(
+            "unknown media kind {other:?}; use image, video or all"
+        ))),
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct MediaRow {
+    id: String,
+    name: String,
+    parent_id: String,
+    mime: Option<String>,
+    size: i64,
+    updated_at: i64,
+    path: String,
+    blob_sha: Option<String>,
+    thumb_sha: Option<String>,
+}
+
+/// `GET /api/files/media` — flat, newest-first media listing across the whole
+/// accessible subtree. The Android gallery uses this instead of walking every
+/// folder, which would be unbounded on a large drive.
+pub async fn media(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Query(params): Query<MediaQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let scope = Scope::for_user(&user)?;
+    let filter = media_kind_filter(params.kind.as_deref())?;
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_MEDIA_LIMIT)
+        .clamp(1, MAX_MEDIA_LIMIT);
+    let offset = params.offset.unwrap_or(0);
+
+    let sql = format!(
+        "{SCOPE_CTE} ) , paths(id, path, visited) AS ( \
+           SELECT id, '', ',' || id || ',' FROM nodes WHERE id = ? \
+           UNION ALL \
+           SELECT n.id, CASE WHEN p.path = '' THEN n.name ELSE p.path || '/' || n.name END, \
+                  p.visited || n.id || ',' \
+           FROM nodes n JOIN paths p ON n.parent_id = p.id \
+           WHERE instr(p.visited, ',' || n.id || ',') = 0 AND length(p.visited) < 100000 \
+         ) \
+         SELECT n.id, n.name, n.parent_id, n.mime, n.size, n.updated_at, p.path, \
+                n.blob_sha, n.thumb_sha \
+         FROM nodes n JOIN paths p ON p.id = n.id \
+         WHERE n.kind = 'file' AND {filter} AND n.id IN (SELECT id FROM scope) \
+         ORDER BY n.updated_at DESC, n.name COLLATE NOCASE, n.id \
+         LIMIT ? OFFSET ?",
+        SCOPE_CTE = files::SCOPE_CTE
+    );
+    let mut rows: Vec<MediaRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(&scope.root)
+        .bind(&scope.root)
+        .bind(i64::from(limit) + 1)
+        .bind(i64::from(offset))
+        .fetch_all(&state.pool)
+        .await?;
+    let has_more = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
+    let next_offset = if has_more {
+        Some(offset.saturating_add(limit))
+    } else {
+        None
+    };
+
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "kind": "file",
+                "name": row.name,
+                "parent_id": row.parent_id,
+                "mime": row.mime,
+                "size": row.size,
+                "updated_at": row.updated_at,
+                "path": row.path,
+                "has_thumb": row.thumb_sha.is_some(),
+                "sha256": row.blob_sha,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "items": items, "next_offset": next_offset })))
+}
+
+#[derive(Deserialize)]
 pub struct CreateFolderRequest {
     pub parent_id: Option<String>,
     pub name: String,
@@ -1142,6 +1251,7 @@ struct FileSearchRow {
     updated_at: i64,
     path: String,
     blob_sha: Option<String>,
+    thumb_sha: Option<String>,
     text_snip: Option<String>,
     desc_snip: Option<String>,
 }
@@ -1155,6 +1265,7 @@ struct LikeSearchRow {
     size: i64,
     updated_at: i64,
     blob_sha: Option<String>,
+    thumb_sha: Option<String>,
 }
 
 pub async fn search(
@@ -1181,6 +1292,7 @@ pub async fn search(
                WHERE instr(p.visited, ',' || n.id || ',') = 0 AND length(p.visited) < 100000 \
              ) \
              SELECT n.id, n.name, n.parent_id, n.mime, n.size, n.updated_at, p.path, n.blob_sha, \
+                    n.thumb_sha, \
                     snippet(files_fts, 2, char(1), char(2), '…', 18) AS text_snip, \
                     snippet(files_fts, 3, char(1), char(2), '…', 18) AS desc_snip \
              FROM files_fts f JOIN nodes n ON n.id = f.file_id JOIN paths p ON p.id = n.id \
@@ -1215,6 +1327,7 @@ pub async fn search(
                         "updated_at": row.updated_at,
                         "path": row.path,
                         "snippet": snippet,
+                        "has_thumb": row.thumb_sha.is_some(),
                         "sha256": row.blob_sha,
                     }));
                 }
@@ -1223,7 +1336,8 @@ pub async fn search(
                 tracing::warn!(error = %err, "file fts query failed, falling back to LIKE");
                 let like = format!("%{}%", like_escape(query));
                 let sql = format!(
-                    "{} ) SELECT n.id, n.name, n.parent_id, n.mime, n.size, n.updated_at, n.blob_sha \
+                    "{} ) SELECT n.id, n.name, n.parent_id, n.mime, n.size, n.updated_at, \
+                     n.blob_sha, n.thumb_sha \
                      FROM nodes n \
                      WHERE n.kind = 'file' AND n.id IN (SELECT id FROM scope) \
                        AND (n.name LIKE ? ESCAPE '\\' OR n.vision_description LIKE ? ESCAPE '\\') \
@@ -1247,6 +1361,7 @@ pub async fn search(
                         "updated_at": row.updated_at,
                         "path": "",
                         "snippet": "",
+                        "has_thumb": row.thumb_sha.is_some(),
                         "sha256": row.blob_sha,
                     }));
                 }
@@ -1448,5 +1563,18 @@ mod tests {
         let value = safe_snippet("<script>\u{1}hello\u{2}</script>");
         assert!(value.contains("&lt;script&gt;"));
         assert!(value.contains("<mark>hello</mark>"));
+    }
+
+    #[test]
+    fn media_kind_filters_are_fixed_sql_fragments() {
+        assert!(media_kind_filter(None).unwrap().contains("image/"));
+        assert!(media_kind_filter(Some("photos"))
+            .unwrap()
+            .contains("image/"));
+        assert!(media_kind_filter(Some("videos"))
+            .unwrap()
+            .contains("video/"));
+        assert!(media_kind_filter(Some("all")).unwrap().contains("video/"));
+        assert!(media_kind_filter(Some("image/'; DROP TABLE nodes; --")).is_err());
     }
 }

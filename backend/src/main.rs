@@ -38,16 +38,26 @@ pub fn now() -> i64 {
         .unwrap_or(0)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Hidden parser-subprocess entry point. This must run before tracing or any
-    // server configuration: the child extracts one blob and exits, so it can
-    // never start the HTTP server, retention job, or index/vision workers.
+fn main() -> anyhow::Result<()> {
+    // Hidden parser-subprocess entry point. This must run before the tokio
+    // runtime is built: `#[tokio::main]` used to spawn a multi-thread runtime
+    // (one worker thread per core, each reserving a 64 MiB malloc arena) before
+    // this dispatch, pushing the child past the parser RLIMIT_AS ceiling so it
+    // aborted or hung at startup. The child extracts one blob and exits; it can
+    // never start the runtime, HTTP server, retention job, or index/vision
+    // workers.
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--extract-worker")) {
         files::worker::run_extract_worker_cli()?;
         return Ok(());
     }
 
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -173,6 +183,7 @@ async fn main() -> anyhow::Result<()> {
             post(routes::files::upload).layer(DefaultBodyLimit::max(upload_limit)),
         )
         .route("/api/files/recent", get(routes::files::recent))
+        .route("/api/files/media", get(routes::files::media))
         .route("/api/files/search", get(routes::files::search))
         .route("/api/files/stats", get(routes::files::stats))
         .route(
@@ -310,20 +321,28 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     /// The parser subprocess shares the server binary; the hidden dispatch must
-    /// stay ahead of tracing/config/state initialization so a child can never
-    /// acquire the database, bind the listener, or spawn workers.
+    /// stay ahead of the tokio runtime build, tracing, config, and state
+    /// initialization so a child can never spawn the runtime's per-core worker
+    /// threads, acquire the database, bind the listener, or spawn workers.
     #[test]
     fn extract_worker_dispatch_precedes_server_initialization() {
         let source = include_str!("main.rs");
         let dispatch = source
             .find("--extract-worker")
             .expect("extract worker dispatch is missing");
+        let runtime = source
+            .find("new_multi_thread")
+            .expect("runtime construction is missing");
         let tracing = source
             .find("tracing_subscriber::registry")
             .expect("tracing initialization is missing");
         let state = source
             .find("state::AppState {")
             .expect("state initialization is missing");
+        assert!(
+            dispatch < runtime,
+            "extract worker dispatch must precede tokio runtime construction"
+        );
         assert!(
             dispatch < tracing,
             "extract worker dispatch must precede tracing initialization"

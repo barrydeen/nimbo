@@ -1,7 +1,9 @@
 use serde_json::{json, Map, Value};
 use std::io::{Cursor, Read};
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_TEXT_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
@@ -17,6 +19,10 @@ const MAX_ARCHIVE_TOTAL: u64 = 64 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRY: u64 = 8 * 1024 * 1024;
 const MAX_EXIF_FIELDS: usize = 80;
 const MAX_XML_EVENTS: usize = 1_000_000;
+/// ffmpeg is optional at runtime; when present this bounds the JPEG frame it
+/// may return and the time it may spend seeking/decoding.
+const MAX_VIDEO_THUMBNAIL_BYTES: usize = 4 * 1024 * 1024;
+const VIDEO_THUMBNAIL_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Extraction {
@@ -364,6 +370,145 @@ fn image_metadata(bytes: &[u8]) -> (Map<String, Value>, Option<Vec<u8>>, Option<
     }
 
     (info, thumbnail, warning, partial)
+}
+
+#[cfg(unix)]
+fn limit_video_child(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            let core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::setrlimit(libc::RLIMIT_CORE, &core) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let cpu = libc::rlimit {
+                rlim_cur: 60,
+                rlim_max: 60,
+            };
+            if libc::setrlimit(libc::RLIMIT_CPU, &cpu) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let address_space = libc::rlimit {
+                rlim_cur: 4 * 1024 * 1024 * 1024,
+                rlim_max: 4 * 1024 * 1024 * 1024,
+            };
+            if libc::setrlimit(libc::RLIMIT_AS, &address_space) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn limit_video_child(_command: &mut Command) {}
+
+/// Extracts one representative JPEG frame from a video with the optional
+/// `ffmpeg` binary. Seeking before the input keeps this cheap for large files;
+/// a zero-offset retry covers too-short clips. The whole child process is
+/// bounded in time and address space, and only a capped stdout frame is read.
+fn ffmpeg_frame(path: &Path, seek: &str) -> Result<Vec<u8>, String> {
+    let mut command = Command::new("ffmpeg");
+    command
+        .arg("-nostdin")
+        .arg("-v")
+        .arg("error")
+        .arg("-threads")
+        .arg("1")
+        .arg("-ss")
+        .arg(seek)
+        .arg("-i")
+        .arg(path)
+        .args([
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=512:512:force_original_aspect_ratio=decrease",
+            "-pix_fmt",
+            "yuvj420p",
+            "-q:v",
+            "4",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    limit_video_child(&mut command);
+
+    let mut child = command.spawn().map_err(|err| err.to_string())?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "ffmpeg produced no stdout".to_string())?;
+    let reader = std::thread::spawn(move || -> Result<Vec<u8>, String> {
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            match stdout.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if output.len() + read > MAX_VIDEO_THUMBNAIL_BYTES {
+                        return Err("video thumbnail exceeded its size limit".into());
+                    }
+                    output.extend_from_slice(&buffer[..read]);
+                }
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+        Ok(output)
+    });
+
+    let deadline = Instant::now() + VIDEO_THUMBNAIL_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("ffmpeg timed out".into());
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err.to_string());
+            }
+        }
+    };
+    let bytes = reader
+        .join()
+        .map_err(|_| "video thumbnail reader stopped unexpectedly".to_string())??;
+    if !status.success() {
+        return Err(format!("ffmpeg exited with {status}"));
+    }
+    if bytes.is_empty() {
+        return Err("ffmpeg produced an empty frame".into());
+    }
+    Ok(bytes)
+}
+
+fn video_thumbnail(path: &Path) -> Option<Vec<u8>> {
+    for seek in ["1", "0"] {
+        match ffmpeg_frame(path, seek) {
+            Ok(bytes) => return Some(bytes),
+            Err(err) => {
+                tracing::debug!(error = %err, seek = %seek, "video thumbnail attempt failed")
+            }
+        }
+    }
+    tracing::debug!("video thumbnails unavailable (install ffmpeg to enable them)");
+    None
 }
 
 fn pdf_string(bytes: &[u8]) -> String {
@@ -973,6 +1118,13 @@ pub fn extract(path: &Path, name: &str, mime: &str) -> Extraction {
         }
         extraction.text = text;
         extraction.partial |= partial;
+    } else if mime.starts_with("video/") {
+        if let Some(thumbnail) = video_thumbnail(path) {
+            extraction
+                .metadata
+                .insert("video".into(), json!({ "thumbnail": "jpeg" }));
+            extraction.thumbnail = Some(thumbnail);
+        }
     } else if is_audio(mime) {
         let (audio_info, warning) = audio_metadata(path);
         if !audio_info.is_empty() {

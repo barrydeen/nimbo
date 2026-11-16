@@ -46,7 +46,7 @@ LABEL org.opencontainers.image.title="Nimbo" \
       org.opencontainers.image.created="${CREATED}"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl passwd \
+    && apt-get install -y --no-install-recommends ca-certificates curl passwd ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 nimbo \
     && useradd --system --uid 10001 --gid 10001 --create-home \

@@ -25,13 +25,15 @@ const WORK_PERMITS: usize = 2;
 /// thumbnail; 16 MiB leaves generous JSON-escaping headroom while preventing a
 /// buggy child from making the parent buffer unbounded.
 const MAX_EXTRACT_RESULT_BYTES: usize = 16 * 1024 * 1024;
-/// Hard limits applied to the parser child on Unix. The address-space limit is
-/// conservative relative to the 256 MiB image-decode ceiling and a 2 GiB
-/// container, leaving room for the runtime and parser working copies.
+/// Hard limits applied to the parser child on Unix. The address-space limit
+/// leaves room for the 256 MiB image-decode ceiling, parser working copies and
+/// the optional ffmpeg thumbnail child, whose own virtual reservations are
+/// larger than its resident frame. The container memory limit remains the hard
+/// resident-memory backstop.
 #[cfg(unix)]
 const PARSER_RLIMIT_CPU_SECONDS: libc::rlim_t = 300;
 #[cfg(unix)]
-const PARSER_RLIMIT_ADDRESS_SPACE: libc::rlim_t = 1024 * 1024 * 1024;
+const PARSER_RLIMIT_ADDRESS_SPACE: libc::rlim_t = 4 * 1024 * 1024 * 1024;
 #[cfg(unix)]
 const PARSER_RLIMIT_CORE: libc::rlim_t = 0;
 
@@ -949,7 +951,7 @@ mod tests {
         let core = std::hint::black_box(PARSER_RLIMIT_CORE);
         assert!(cpu > 0 && cpu <= 600);
         assert!(address_space >= 512 * 1024 * 1024);
-        assert!(address_space <= 2 * 1024 * 1024 * 1024);
+        assert!(address_space <= 4 * 1024 * 1024 * 1024);
         assert_eq!(core, 0);
     }
 }

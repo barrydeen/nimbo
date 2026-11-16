@@ -1,9 +1,13 @@
 package app.nimbo.backup.ui
 
 import android.app.Application
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -11,7 +15,12 @@ import app.nimbo.backup.data.Prefs
 import app.nimbo.backup.data.InsecureTransportException
 import app.nimbo.backup.data.ServerConfig
 import app.nimbo.backup.data.ServerOrigin
+import app.nimbo.backup.data.api.DocSummary
+import app.nimbo.backup.data.api.NodeSummary
+import app.nimbo.backup.data.api.NimboApiException
+import app.nimbo.backup.data.api.NimboAuthException
 import app.nimbo.backup.data.api.NimboClient
+import app.nimbo.backup.data.api.InstanceInfo
 import app.nimbo.backup.data.db.AppDb
 import app.nimbo.backup.data.db.FileFailure
 import app.nimbo.backup.data.db.FolderCounts
@@ -22,13 +31,18 @@ import app.nimbo.backup.sync.BackupWorker
 import app.nimbo.backup.sync.MediaObserverService
 import app.nimbo.backup.util.SafeLog
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.io.IOException
 
 data class FolderUi(
     val folder: FolderEntity,
@@ -48,6 +62,9 @@ data class UiState(
     val folders: List<FolderUi> = emptyList(),
     val totalUploaded: Long = 0,
     val snackbar: String? = null,
+    val instanceName: String = "",
+    /** null when the scope has not been probed yet. */
+    val backupScope: Boolean? = null,
 )
 
 class BackupViewModel(app: Application) : AndroidViewModel(app) {
@@ -58,6 +75,22 @@ class BackupViewModel(app: Application) : AndroidViewModel(app) {
 
     private val snackbar = MutableStateFlow<String?>(null)
     private val loading = MutableStateFlow(true)
+    private val instance = MutableStateFlow<InstanceInfo?>(null)
+    private val browse = MutableStateFlow(BrowseState())
+
+    /** Remote browsing state (files, gallery, search and the read-only vault). */
+    val browseState: StateFlow<BrowseState> = browse.asStateFlow()
+
+    @Volatile
+    private var cachedClient: NimboClient? = null
+    @Volatile
+    private var cachedConfig: ServerConfig? = null
+
+    private var filesGeneration = 0
+    private var galleryGeneration = 0
+    private var vaultGeneration = 0
+    private var docGeneration = 0
+    private var searchJob: Job? = null
 
     private data class PrefsState(
         val config: ServerConfig?,
@@ -90,7 +123,8 @@ class BackupViewModel(app: Application) : AndroidViewModel(app) {
         ) { folders, counts, failures, total -> DbState(folders, counts, failures, total) },
         snackbar,
         loading,
-    ) { prefsState, dbState, snack, loadingNow ->
+        instance,
+    ) { prefsState, dbState, snack, loadingNow, instanceInfo ->
         val errors = dbState.failures.groupBy { it.folderId }.mapValues { it.value.first().lastError }
         UiState(
             loading = loadingNow,
@@ -110,6 +144,8 @@ class BackupViewModel(app: Application) : AndroidViewModel(app) {
             },
             totalUploaded = dbState.totalUploaded,
             snackbar = snack,
+            instanceName = instanceInfo?.instance_name.orEmpty(),
+            backupScope = instanceInfo?.backup_scope,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), UiState())
 
@@ -123,6 +159,39 @@ class BackupViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             loading.value = false
+            if (prefs.config.first()?.isConfigured == true && !prefs.authFailed.first()) {
+                probeInstance()
+            }
+        }
+    }
+
+    private suspend fun probeInstance() {
+        try {
+            instance.value = client().instance()
+        } catch (e: Exception) {
+            if (e is NimboAuthException) {
+                prefs.markAuthFailed()
+            } else {
+                SafeLog.w(TAG, "instance probe failed", e)
+            }
+        }
+    }
+
+    private suspend fun client(): NimboClient {
+        val config = cachedConfig ?: prefs.config.first()
+            ?: throw IOException("Pair this device first")
+        val cached = cachedClient
+        if (cached != null && cachedConfig == config) return cached
+        return synchronized(this) {
+            val current = cachedClient
+            if (current != null && cachedConfig == config) {
+                current
+            } else {
+                NimboClient(config.serverUrl, config.token, config.allowInsecureHttp).also {
+                    cachedClient = it
+                    cachedConfig = config
+                }
+            }
         }
     }
 
@@ -146,8 +215,19 @@ class BackupViewModel(app: Application) : AndroidViewModel(app) {
                     deviceName = deviceName.trim(),
                     allowInsecureHttp = allowInsecureHttp,
                 )
-                if (testNow) NimboClient(normalized.rootUrl, config.token, allowInsecureHttp).testConnection()
+                val tested = if (testNow) {
+                    NimboClient(
+                        normalized.rootUrl,
+                        config.token,
+                        allowInsecureHttp,
+                    ).testConnection()
+                } else {
+                    null
+                }
                 prefs.save(config)
+                cachedClient = null
+                cachedConfig = null
+                instance.value = tested
                 if (state.value.instantMode) MediaObserverService.maybeStart(context)
                 if (testNow) BackupWorker.requestSync(context)
                 snackbar.value = if (testNow) "Connected and saved" else "Saved without a connection test"
@@ -175,6 +255,10 @@ class BackupViewModel(app: Application) : AndroidViewModel(app) {
                         allowInsecureHttp = false,
                     ),
                 )
+                cachedClient = null
+                cachedConfig = null
+                instance.value = null
+                browse.value = BrowseState()
                 if (state.value.instantMode) MediaObserverService.maybeStart(context)
                 snackbar.value = "Paired. Backups run on unmetered networks."
             } catch (_: InsecureTransportException) {
@@ -288,16 +372,370 @@ class BackupViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) { prefs.setObserverError(null) }
     }
 
+    // ------------------------------------------------------------ remote files
+
+    fun openFolder(folderId: String) {
+        val generation = ++filesGeneration
+        val current = browse.value.files
+        browse.update {
+            it.copy(
+                files = it.files.copy(
+                    folderId = folderId,
+                    folderName = if (folderId.isBlank()) "My Drive" else it.files.folderName,
+                    loading = true,
+                    error = null,
+                    items = if (folderId != current.folderId) emptyList() else it.files.items,
+                ),
+            )
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val listing = client().listFolder(folderId)
+                if (generation != filesGeneration) return@launch
+                val id = normalizeFolderId(listing.folder.id)
+                browse.update {
+                    it.copy(
+                        files = FilesState(
+                            folderId = id,
+                            folderName = listing.folder.name,
+                            breadcrumbs = listing.breadcrumbs.map { crumb ->
+                                CrumbUi(normalizeFolderId(crumb.id), crumb.name)
+                            },
+                            items = listing.items,
+                            loading = false,
+                        ),
+                    )
+                }
+            } catch (e: Exception) {
+                if (generation != filesGeneration) return@launch
+                val message = describeError(e)
+                browse.update { it.copy(files = it.files.copy(loading = false, error = message)) }
+            }
+        }
+    }
+
+    fun refreshFiles() {
+        openFolder(browse.value.files.folderId)
+    }
+
+    fun goToParentFolder() {
+        val crumbs = browse.value.files.breadcrumbs
+        val parent = if (crumbs.size >= 2) crumbs[crumbs.size - 2].id else ""
+        openFolder(parent)
+    }
+
+    fun openItem(item: NodeSummary) {
+        when {
+            item.kind == "folder" -> openFolder(item.id)
+            item.mime?.startsWith("image/") == true -> browse.update { it.copy(imageViewer = item) }
+            item.mime?.startsWith("video/") == true -> browse.update { it.copy(imageViewer = item) }
+            else -> snackbar.value = "Tap the download button to save this file"
+        }
+    }
+
+    fun openImageViewer(item: NodeSummary) {
+        browse.update { it.copy(imageViewer = item) }
+    }
+
+    fun closeImageViewer() {
+        browse.update { it.copy(imageViewer = null) }
+    }
+
+    // --------------------------------------------------------------- gallery
+
+    fun setMediaFilter(filter: MediaFilter) {
+        if (browse.value.gallery.filter == filter) return
+        galleryGeneration++
+        browse.update {
+            it.copy(
+                gallery = it.gallery.copy(
+                    filter = filter,
+                    items = emptyList(),
+                    nextOffset = null,
+                    error = null,
+                ),
+            )
+        }
+        loadGallery(reset = true)
+    }
+
+    fun loadGallery(reset: Boolean = false) {
+        val gallery = browse.value.gallery
+        if (gallery.loading) return
+        if (!reset && gallery.nextOffset == null && gallery.items.isNotEmpty()) return
+        val generation = if (reset) ++galleryGeneration else galleryGeneration
+        val filter = gallery.filter
+        val offset = if (reset) 0 else gallery.items.size
+        browse.update {
+            it.copy(
+                gallery = it.gallery.copy(
+                    loading = true,
+                    error = null,
+                    items = if (reset) emptyList() else it.gallery.items,
+                    nextOffset = if (reset) null else it.gallery.nextOffset,
+                ),
+            )
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val page = client().media(filter.apiValue, offset, GALLERY_PAGE)
+                if (generation != galleryGeneration) return@launch
+                browse.update {
+                    it.copy(
+                        gallery = it.gallery.copy(
+                            items = if (reset) page.items else it.gallery.items + page.items,
+                            nextOffset = page.next_offset,
+                            loading = false,
+                        ),
+                    )
+                }
+            } catch (e: Exception) {
+                if (generation != galleryGeneration) return@launch
+                val message = describeError(e)
+                browse.update { it.copy(gallery = it.gallery.copy(loading = false, error = message)) }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- search
+
+    fun search(query: String) {
+        browse.update {
+            it.copy(
+                search = it.search.copy(
+                    query = query,
+                    loading = query.isNotBlank(),
+                    error = null,
+                    searched = false,
+                    results = if (query.isBlank()) emptyList() else it.search.results,
+                ),
+            )
+        }
+        searchJob?.cancel()
+        val trimmed = query.trim()
+        if (trimmed.isEmpty()) return
+        searchJob = viewModelScope.launch(Dispatchers.IO) {
+            delay(350)
+            try {
+                val results = client().searchFiles(trimmed)
+                if (browse.value.search.query != query) return@launch
+                browse.update {
+                    it.copy(
+                        search = it.search.copy(
+                            results = results,
+                            loading = false,
+                            searched = true,
+                        ),
+                    )
+                }
+            } catch (e: Exception) {
+                if (browse.value.search.query != query) return@launch
+                val message = describeError(e)
+                browse.update {
+                    it.copy(search = it.search.copy(loading = false, error = message, searched = true))
+                }
+            }
+        }
+    }
+
+    // ----------------------------------------------------------- read-only vault
+
+    fun loadVault(force: Boolean = false) {
+        if (instance.value?.backup_scope == true) {
+            browse.update {
+                it.copy(vault = it.vault.copy(loading = false, loaded = true, error = null))
+            }
+            return
+        }
+        val vault = browse.value.vault
+        if (vault.loading || (vault.loaded && !force)) return
+        val generation = ++vaultGeneration
+        browse.update { it.copy(vault = it.vault.copy(loading = true, error = null)) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val documents = client().docsTree()
+                if (generation != vaultGeneration) return@launch
+                browse.update {
+                    it.copy(
+                        vault = it.vault.copy(
+                            documents = documents,
+                            loading = false,
+                            loaded = true,
+                        ),
+                    )
+                }
+            } catch (e: Exception) {
+                if (generation != vaultGeneration) return@launch
+                val message = describeError(e)
+                browse.update { it.copy(vault = it.vault.copy(loading = false, error = message)) }
+            }
+        }
+    }
+
+    fun openDoc(document: DocSummary) {
+        val generation = ++docGeneration
+        browse.update {
+            it.copy(
+                docViewer = DocViewerState(
+                    path = document.path,
+                    title = document.title,
+                    loading = true,
+                ),
+            )
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val content = client().docContent(document.path)
+                if (generation != docGeneration) return@launch
+                browse.update {
+                    it.copy(
+                        docViewer = DocViewerState(
+                            path = content.path,
+                            title = content.title.ifBlank { document.title },
+                            content = content.content,
+                            loading = false,
+                        ),
+                    )
+                }
+            } catch (e: Exception) {
+                if (generation != docGeneration) return@launch
+                val message = describeError(e)
+                browse.update {
+                    it.copy(docViewer = it.docViewer?.copy(loading = false, error = message))
+                }
+            }
+        }
+    }
+
+    fun closeDoc() {
+        docGeneration++
+        browse.update { it.copy(docViewer = null) }
+    }
+
+    // -------------------------------------------------------------- downloads
+
+    fun downloadTarget(item: NodeSummary): DownloadTarget =
+        DownloadTarget(id = item.id, name = item.name, mime = item.mime)
+
+    /** Saves through MediaStore on Android 10+; older versions use the SAF picker. */
+    fun download(item: NodeSummary) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        val id = item.id
+        if (id in browse.value.downloading) return
+        browse.update { it.copy(downloading = it.downloading + id) }
+        viewModelScope.launch(Dispatchers.IO) {
+            var uri: Uri? = null
+            try {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, safeDownloadName(item.name))
+                    put(MediaStore.Downloads.MIME_TYPE, item.mime ?: "application/octet-stream")
+                    put(
+                        MediaStore.Downloads.RELATIVE_PATH,
+                        "${Environment.DIRECTORY_DOWNLOADS}/Nimbo",
+                    )
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val resolver = context.contentResolver
+                uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: throw IOException("Could not create a download entry")
+                val destination = uri
+                val stream = resolver.openOutputStream(destination)
+                    ?: throw IOException("Could not open the download destination")
+                stream.use { output -> client().downloadTo(id, output) }
+                resolver.update(
+                    destination,
+                    ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) },
+                    null,
+                    null,
+                )
+                snackbar.value = "Saved ${item.name} to Downloads/Nimbo"
+            } catch (e: Exception) {
+                uri?.let { pending ->
+                    runCatching { context.contentResolver.delete(pending, null, null) }
+                }
+                snackbar.value = "Download failed: ${describeError(e)}"
+            } finally {
+                browse.update { it.copy(downloading = it.downloading - id) }
+            }
+        }
+    }
+
+    /** Completes a download into a user-chosen SAF document URI. */
+    fun saveDownloadTo(target: DownloadTarget, uri: Uri) {
+        if (target.id in browse.value.downloading) return
+        browse.update { it.copy(downloading = it.downloading + target.id) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val resolver = context.contentResolver
+                val stream = resolver.openOutputStream(uri)
+                    ?: throw IOException("Could not open the selected file")
+                stream.use { output -> client().downloadTo(target.id, output) }
+                snackbar.value = "Saved ${target.name}"
+            } catch (e: Exception) {
+                runCatching { context.contentResolver.delete(uri, null, null) }
+                snackbar.value = "Download failed: ${describeError(e)}"
+            } finally {
+                browse.update { it.copy(downloading = it.downloading - target.id) }
+            }
+        }
+    }
+
+    suspend fun loadThumbnail(item: NodeSummary): ByteArray? = try {
+        if (item.has_thumb) client().thumbnail(item.id) else null
+    } catch (e: Exception) {
+        if (e is NimboAuthException) prefs.markAuthFailed()
+        null
+    }
+
+    suspend fun loadFullImage(item: NodeSummary): ByteArray? = try {
+        if (item.size > MAX_INLINE_IMAGE_BYTES) null else client().contentBytes(item.id)
+    } catch (e: Exception) {
+        if (e is NimboAuthException) prefs.markAuthFailed()
+        null
+    }
+
+    private fun safeDownloadName(name: String): String {
+        val cleaned = name.trim().map { ch ->
+            if (ch == '/' || ch == '\\' || ch.isISOControl()) '_' else ch
+        }.joinToString("")
+        return cleaned.ifBlank { "nimbo-download" }
+    }
+
+    private fun normalizeFolderId(id: String): String = if (id == "root") "" else id
+
+    private suspend fun describeError(e: Exception): String {
+        if (e is NimboAuthException) {
+            prefs.markAuthFailed()
+            return "The device token was rejected. Re-pair to continue."
+        }
+        if (e is NimboApiException) {
+            return when (e.code) {
+                403 -> "This device token is backup-only. Pair a full-scope token to browse the drive and vault."
+                404 -> "That item no longer exists."
+                413 -> "That item is too large to preview."
+                429 -> "The server is busy. Try again shortly."
+                else -> e.message ?: "Server error ${e.code}"
+            }
+        }
+        return e.message ?: "Network error"
+    }
+
     fun disconnect() {
         viewModelScope.launch(Dispatchers.IO) {
             MediaObserverService.stop(context)
             BackupWorker.cancelAll(context)
             BackupEngine.serialized { prefs.clearPairing() }
+            cachedClient = null
+            cachedConfig = null
+            instance.value = null
+            browse.value = BrowseState()
             snackbar.value = "Disconnected. Folder selections are kept for re-pairing."
         }
     }
 
     companion object {
         private const val TAG = "NimboBackup"
+        private const val GALLERY_PAGE = 120
+        private const val MAX_INLINE_IMAGE_BYTES = 40L * 1024 * 1024
     }
 }
