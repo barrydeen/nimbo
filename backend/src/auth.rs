@@ -14,6 +14,7 @@ use rand::RngCore;
 use std::sync::Arc;
 
 pub const COOKIE_NAME: &str = "nimbo_session";
+pub const DEVICE_TOKEN_PREFIX: &str = "nmb_";
 const MAX_FAILURES: usize = 5;
 const FAILURE_WINDOW_SECS: i64 = 300;
 
@@ -51,6 +52,15 @@ pub fn new_token() -> (String, String) {
     (token, hash)
 }
 
+/// Device tokens carry a `nmb_` prefix so they are recognisable and greppable
+/// in config files. Returns (raw token, stored hash of the full raw token).
+pub fn new_device_token() -> (String, String) {
+    let (secret, _) = new_token();
+    let raw = format!("{DEVICE_TOKEN_PREFIX}{secret}");
+    let hash = sha256_hex(raw.as_bytes());
+    (raw, hash)
+}
+
 pub fn session_cookie(token: &str, max_age_secs: i64, secure: bool) -> String {
     let mut cookie =
         format!("{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age_secs}");
@@ -74,6 +84,14 @@ pub fn token_from_headers(headers: &HeaderMap) -> Option<String> {
     raw.split(';')
         .map(str::trim)
         .find_map(|part| part.strip_prefix(&prefix).map(str::to_string))
+}
+
+pub fn bearer_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    raw.strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
 }
 
 pub async fn create_session(
@@ -123,16 +141,52 @@ pub async fn delete_session(pool: &sqlx::SqlitePool, token: &str) -> Result<(), 
     Ok(())
 }
 
-/// Middleware: rejects requests without a valid session.
+/// Resolve a device token (`nmb_…`) to its user, touching `last_used_at`.
+pub async fn lookup_device_token(
+    pool: &sqlx::SqlitePool,
+    token: &str,
+) -> Result<Option<AuthUser>, ApiError> {
+    let token_hash = sha256_hex(token.as_bytes());
+    let now = crate::now();
+    let row: Option<(String, String, String, String)> = sqlx::query_as(
+        "SELECT t.id, u.id, u.username, u.role FROM device_tokens t \
+         JOIN users u ON u.id = t.user_id \
+         WHERE t.token_hash = ? AND t.revoked_at IS NULL \
+           AND (t.expires_at IS NULL OR t.expires_at > ?)",
+    )
+    .bind(&token_hash)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+    let Some((token_id, id, username, role)) = row else {
+        return Ok(None);
+    };
+    sqlx::query("UPDATE device_tokens SET last_used_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(&token_id)
+        .execute(pool)
+        .await?;
+    Ok(Some(AuthUser { id, username, role }))
+}
+
+/// Middleware: rejects requests without valid credentials. Accepts either a
+/// device token (`Authorization: Bearer nmb_…`) for native clients or the
+/// `nimbo_session` cookie for browser sessions.
 pub async fn require_session(
     State(state): State<Arc<AppState>>,
     mut req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let token = token_from_headers(req.headers()).ok_or_else(ApiError::unauthorized)?;
-    let user = lookup_session(&state.pool, &token)
-        .await?
-        .ok_or_else(ApiError::unauthorized)?;
+    let user = if let Some(bearer) = bearer_token_from_headers(req.headers()) {
+        lookup_device_token(&state.pool, &bearer)
+            .await?
+            .ok_or_else(ApiError::unauthorized)?
+    } else {
+        let token = token_from_headers(req.headers()).ok_or_else(ApiError::unauthorized)?;
+        lookup_session(&state.pool, &token)
+            .await?
+            .ok_or_else(ApiError::unauthorized)?
+    };
     req.extensions_mut().insert(user);
     Ok(next.run(req).await)
 }

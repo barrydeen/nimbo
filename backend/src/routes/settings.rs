@@ -28,6 +28,8 @@ pub async fn get_llm(State(state): State<Arc<AppState>>) -> Result<Json<Value>, 
             "model": cfg.model,
             "temperature": cfg.temperature,
             "api_key_set": !cfg.api_key.is_empty(),
+            "vision_model": cfg.vision_model,
+            "describe_images": cfg.describe_images,
         }))),
         None => Ok(Json(json!({
             "configured": false,
@@ -35,6 +37,8 @@ pub async fn get_llm(State(state): State<Arc<AppState>>) -> Result<Json<Value>, 
             "model": "",
             "temperature": 0.7,
             "api_key_set": false,
+            "vision_model": null,
+            "describe_images": true,
         }))),
     }
 }
@@ -45,6 +49,8 @@ pub struct LlmRequest {
     pub model: String,
     pub api_key: Option<String>,
     pub temperature: Option<f32>,
+    pub vision_model: Option<String>,
+    pub describe_images: Option<bool>,
 }
 
 pub async fn put_llm(
@@ -68,16 +74,32 @@ pub async fn put_llm(
     let existing = agent::load_config(&state).await?;
     let api_key = match req.api_key {
         Some(key) if !key.trim().is_empty() => key.trim().to_string(),
-        _ => existing.map(|cfg| cfg.api_key).unwrap_or_default(),
+        _ => existing
+            .as_ref()
+            .map(|cfg| cfg.api_key.clone())
+            .unwrap_or_default(),
     };
+    let vision_model = match req.vision_model {
+        Some(model) if !model.trim().is_empty() => Some(model.trim().to_string()),
+        _ => existing.as_ref().and_then(|cfg| cfg.vision_model.clone()),
+    };
+    let describe_images = req
+        .describe_images
+        .or_else(|| existing.as_ref().map(|cfg| cfg.describe_images))
+        .unwrap_or(true);
 
     let cfg = LlmConfig {
         base_url,
         model,
         api_key,
         temperature: req.temperature.unwrap_or(0.7).clamp(0.0, 2.0),
+        vision_model,
+        describe_images,
     };
     agent::save_config(&state, &cfg).await?;
+    if let Err(err) = crate::files::vision::requeue_skipped(&state).await {
+        tracing::warn!(error = %err, "could not requeue image descriptions");
+    }
 
     Ok(Json(json!({
         "configured": true,
@@ -85,6 +107,8 @@ pub async fn put_llm(
         "model": cfg.model,
         "temperature": cfg.temperature,
         "api_key_set": !cfg.api_key.is_empty(),
+        "vision_model": cfg.vision_model,
+        "describe_images": cfg.describe_images,
     })))
 }
 

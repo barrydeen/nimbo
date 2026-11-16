@@ -7,6 +7,7 @@ pub struct Config {
     pub static_dir: Option<PathBuf>,
     pub secure_cookies: bool,
     pub session_ttl_secs: i64,
+    pub max_upload_bytes: u64,
 }
 
 impl Config {
@@ -25,16 +26,34 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(30);
+        let max_upload_mb = env::var("NIMBO_MAX_UPLOAD_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(200);
         Ok(Self {
             bind,
             data_dir,
             static_dir,
             secure_cookies,
             session_ttl_secs: ttl_days * 86_400,
+            max_upload_bytes: max_upload_mb * 1024 * 1024,
         })
     }
 
     pub fn vault_dir(&self) -> PathBuf {
         self.data_dir.join("vault")
+    }
+
+    pub fn files_dir(&self) -> PathBuf {
+        self.data_dir.join("files")
+    }
+
+    pub fn blobs_dir(&self) -> PathBuf {
+        self.files_dir().join("blobs")
+    }
+
+    pub fn upload_tmp_dir(&self) -> PathBuf {
+        self.files_dir().join("tmp")
     }
 }

@@ -1,0 +1,75 @@
+name: Bug report
+description: Report a reproducible problem with Nimbo
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please do **not** include API keys, tokens,
+        passwords or private vault data. For security issues, follow
+        [SECURITY.md](https://github.com/barrydeen/nimbo/blob/main/SECURITY.md).
+  - type: checkboxes
+    id: existing
+    attributes:
+      label: Existing issue
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: A clear and concise description of the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start Nimbo with ...
+        2. Open ...
+        3. Click ...
+        4. See error ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Nimbo version or commit
+      placeholder: v0.1.0 or a commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How are you running Nimbo?
+      options:
+        - Docker Compose
+        - Docker
+        - Built from source
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and OS (if UI related)
+      placeholder: Firefox 142 on Linux
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or screenshots
+      description: Redact tokens, keys, file names and other private data.
+      render: shell
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?

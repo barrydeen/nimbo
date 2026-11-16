@@ -1,10 +1,37 @@
+# Build output
 target/
 node_modules/
 .svelte-kit/
 build/
-data/
+dist/
+out/
+
+# Runtime state and secrets
+/data/
 *.db
 *.db-wal
 *.db-shm
+secret.key
 .env
+.env.*
+!.env.example
+
+# Android / Gradle
+.gradle/
+local.properties
+keystore/
+*.keystore
+*.jks
+captures/
+.idea/
+*.iml
+
+# Internal release/QA notes
+/GATES.md
+
+# Editors and OS files
+.vscode/
 .DS_Store
+Thumbs.db
+*.swp
+*~

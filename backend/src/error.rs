@@ -33,6 +33,12 @@ impl ApiError {
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, message)
     }
+    pub fn gone(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::GONE, message)
+    }
+    pub fn payload_too_large(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::PAYLOAD_TOO_LARGE, message)
+    }
     pub fn too_many() -> Self {
         Self::new(
             StatusCode::TOO_MANY_REQUESTS,

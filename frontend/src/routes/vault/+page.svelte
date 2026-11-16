@@ -14,7 +14,9 @@
 	let hash = '';
 	let dirty = false;
 	let saving = false;
-	let preview = false;
+	let split = true;
+	let aiEnabled = false;
+	let editorKey = 0;
 
 	let backlinks: { path: string; title: string }[] = [];
 	let outlinks: { target: string; path: string | null; exists: boolean }[] = [];
@@ -30,18 +32,15 @@
 	let errorMsg = '';
 	let statusMsg = '';
 
-	let railTab: 'links' | 'agent' = 'links';
+	let railTab: 'links' | 'chat' = 'links';
 	let agentMessages: {
 		id: number;
 		role: 'user' | 'assistant';
 		content: string;
-		action?: string;
 	}[] = [];
 	let agentInput = '';
 	let agentBusy = false;
 	let agentError = '';
-	let actionBusy = '';
-	let editorVersion = 0;
 	let msgSeq = 0;
 	let searchTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -92,7 +91,7 @@
 			content = doc.content;
 			hash = doc.hash;
 			dirty = false;
-			preview = false;
+			editorKey += 1;
 			errorMsg = '';
 			searchMode = false;
 			replaceState(`?path=${encodeURIComponent(path)}`, {});
@@ -247,37 +246,6 @@
 		}
 	}
 
-	async function runAction(action: string) {
-		if (!selected || actionBusy) return;
-		actionBusy = action;
-		agentError = '';
-		try {
-			const res = await api.agentAction({ action, path: selected });
-			agentMessages = [
-				...agentMessages,
-				{ id: ++msgSeq, role: 'assistant', content: res.text, action }
-			];
-			railTab = 'agent';
-		} catch (err) {
-			agentError = message(err);
-		} finally {
-			actionBusy = '';
-		}
-	}
-
-	function applyAction(index: number) {
-		const msg = agentMessages[index];
-		if (!msg || !msg.action) return;
-		if (msg.action === 'continue' || msg.action === 'links' || msg.action === 'tags') {
-			content = `${content.trimEnd()}\n\n${msg.content.trim()}\n`;
-		} else {
-			content = `${msg.content.trim()}\n`;
-		}
-		dirty = true;
-		editorVersion += 1;
-		agentMessages = agentMessages.filter((_, i) => i !== index);
-	}
-
 	async function sendAgent() {
 		const userMessage = agentInput.trim();
 		if (!userMessage || agentBusy) return;
@@ -357,6 +325,7 @@
 				<span>{user.username}</span>
 			</div>
 		{/if}
+		<button class="btn ghost" on:click={() => goto('/drive')}>Files</button>
 		{#if user?.role === 'admin'}
 			<button class="btn ghost" on:click={() => goto('/settings')}>Settings</button>
 		{/if}
@@ -448,8 +417,8 @@
 				{#if dirty}<span class="dot dirty" title="Unsaved changes"></span>{/if}
 				{#if statusMsg}<span class="path" style="color: var(--good)">{statusMsg}</span>{/if}
 				<div class="spacer"></div>
-				<button class="btn" on:click={() => (preview = !preview)}>
-					{preview ? 'Edit' : 'Preview'}
+				<button class="btn" class:active={split} on:click={() => (split = !split)}>
+					{split ? 'Single pane' : 'Split preview'}
 				</button>
 				<button class="btn primary" on:click={save} disabled={!dirty || saving}>
 					{saving ? 'Saving…' : 'Save'}
@@ -458,24 +427,30 @@
 				<button class="btn danger" on:click={deleteDoc}>Delete</button>
 			</div>
 
-			{#if preview}
-				<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-				<div class="preview" on:click={onPreviewClick}>
-					<div class="markdown-body">{@html renderMarkdown(content)}</div>
+			<div class="workspace" class:split>
+				<div class="editor-pane">
+					{#key `${selected}:${editorKey}`}
+						<Editor
+							bind:aiEnabled
+							value={content}
+							docPaths={docs.map((d) => d.path)}
+							onchange={(next) => {
+								content = next;
+								dirty = true;
+							}}
+							onsave={save}
+						/>
+					{/key}
 				</div>
-			{:else}
-				{#key `${selected}:${editorVersion}`}
-					<Editor
-						value={content}
-						docPaths={docs.map((d) => d.path)}
-						onchange={(next) => {
-							content = next;
-							dirty = true;
-						}}
-						onsave={save}
-					/>
-				{/key}
-			{/if}
+				{#if split}
+					<div class="preview-pane">
+						<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+						<div class="preview" on:click={onPreviewClick}>
+							<div class="markdown-body">{@html renderMarkdown(content)}</div>
+						</div>
+					</div>
+				{/if}
+			</div>
 		{:else}
 			<div class="empty-state">
 				<div class="inner">
@@ -504,8 +479,8 @@
 			<button class="tab" class:active={railTab === 'links'} on:click={() => (railTab = 'links')}>
 				Links
 			</button>
-			<button class="tab" class:active={railTab === 'agent'} on:click={() => (railTab = 'agent')}>
-				Agent
+			<button class="tab" class:active={railTab === 'chat'} on:click={() => (railTab = 'chat')}>
+				Chat
 			</button>
 		</div>
 
@@ -537,39 +512,14 @@
 				<span class="empty">{docs.length} document{docs.length === 1 ? '' : 's'} indexed.</span>
 			{/if}
 		{:else}
-			<h3>Document actions</h3>
-			<div class="agent-actions">
-				<button class="chip" disabled={!selected || !!actionBusy} on:click={() => runAction('continue')}>
-					Continue
-				</button>
-				<button class="chip" disabled={!selected || !!actionBusy} on:click={() => runAction('grammar')}>
-					Grammar
-				</button>
-				<button class="chip" disabled={!selected || !!actionBusy} on:click={() => runAction('rewrite')}>
-					Rewrite
-				</button>
-				<button class="chip" disabled={!selected || !!actionBusy} on:click={() => runAction('links')}>
-					Links
-				</button>
-				<button class="chip" disabled={!selected || !!actionBusy} on:click={() => runAction('tags')}>
-					Tags
-				</button>
-			</div>
-			{#if actionBusy}
-				<span class="empty">Running {actionBusy}…</span>
-			{/if}
-
 			<h3>Chat</h3>
 			<div class="agent-log">
-				{#each agentMessages as msg, i (msg.id)}
+				{#each agentMessages as msg (msg.id)}
 					<div class="msg" class:user={msg.role === 'user'}>
 						<div class="msg-text">{msg.content}</div>
-						{#if msg.role === 'assistant' && msg.action}
-							<button class="chip apply" on:click={() => applyAction(i)}>Apply</button>
-						{/if}
 					</div>
 				{:else}
-					<span class="empty">Ask about your vault, or run an action above.</span>
+					<span class="empty">Ask about your vault.</span>
 				{/each}
 				{#if agentError}
 					<div class="banner" style="margin: 8px 0 0;">{agentError}</div>

@@ -10,9 +10,14 @@ services:
     volumes:
       - nimbo_data:/data
     environment:
+      # Listen address inside the container.
+      NIMBO_BIND: "${NIMBO_BIND:-0.0.0.0:8080}"
       # Set to "true" when serving behind HTTPS so the session cookie is Secure.
-      NIMBO_SECURE_COOKIES: "false"
-      # NIMBO_SESSION_TTL_DAYS: "30"
+      NIMBO_SECURE_COOKIES: "${NIMBO_SECURE_COOKIES:-false}"
+      # Session lifetime in days.
+      NIMBO_SESSION_TTL_DAYS: "${NIMBO_SESSION_TTL_DAYS:-30}"
+      # Maximum size of one uploaded file, in MiB.
+      NIMBO_MAX_UPLOAD_MB: "${NIMBO_MAX_UPLOAD_MB:-200}"
     restart: unless-stopped
 
 volumes:

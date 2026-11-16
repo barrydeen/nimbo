@@ -74,11 +74,39 @@ pub async fn action(
     let clipped = text.chars().take(8000).collect::<String>();
 
     let (system, user) = match req.action.as_str() {
-        "continue" => (
-            "You are a writing assistant. Continue the text naturally from where it stops. \
-             Match the existing tone and markdown style. Output only the continuation, with no preamble.",
-            clipped,
-        ),
+        "suggest" => {
+            let tail: String = text
+                .chars()
+                .rev()
+                .take(4000)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            (
+                "You are an inline autocomplete for a markdown editor. Given the text before \
+                 the cursor, write the single next line or short sentence (at most 25 words). \
+                 Match the existing tone, language and markdown style. If the text ends \
+                 mid-sentence, finish it. Output only the continuation text: no preamble, no \
+                 quotes, no code fences, no leading newline.",
+                tail,
+            )
+        }
+        "continue" => {
+            let tail: String = text
+                .chars()
+                .rev()
+                .take(4000)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            (
+                "You are a writing assistant. Continue the text naturally from where it stops. \
+                 Match the existing tone and markdown style. Output only the continuation, with no preamble.",
+                tail,
+            )
+        }
         "grammar" => (
             "Fix spelling, grammar, punctuation and clarity. Preserve the author's meaning, tone \
              and markdown formatting. Output only the corrected text.",
@@ -99,11 +127,7 @@ pub async fn action(
                 sqlx::query_as("SELECT path FROM documents ORDER BY lower(path)")
                     .fetch_all(&state.pool)
                     .await?;
-            let paths = rows
-                .into_iter()
-                .map(|r| r.0)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let paths = rows.into_iter().map(|r| r.0).collect::<Vec<_>>().join("\n");
             (
                 "You suggest wikilinks. Given a document and a list of existing document paths, \
                  propose up to five links using [[path]] syntax, each with a one-line reason. \
@@ -117,10 +141,7 @@ pub async fn action(
             clipped,
         ),
         other => {
-            let instruction = req
-                .instruction
-                .clone()
-                .unwrap_or_else(|| other.to_string());
+            let instruction = req.instruction.clone().unwrap_or_else(|| other.to_string());
             (
                 "You are a writing assistant. Follow the instruction and output only the result.",
                 format!("Instruction: {instruction}\n\nText:\n\n{clipped}"),
@@ -128,6 +149,7 @@ pub async fn action(
         }
     };
 
-    let result = agent::complete(&cfg, system, &user, 1200).await?;
+    let max_tokens = if req.action == "suggest" { 90 } else { 1200 };
+    let result = agent::complete(&cfg, system, &user, max_tokens).await?;
     Ok(Json(json!({ "action": req.action, "text": result })))
 }

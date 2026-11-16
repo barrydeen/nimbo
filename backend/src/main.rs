@@ -4,13 +4,15 @@ mod config;
 mod crypto;
 mod db;
 mod error;
+mod files;
 mod routes;
 mod state;
 mod util;
 
 use axum::{
+    extract::DefaultBodyLimit,
     middleware,
-    routing::{any, get, post},
+    routing::{any, delete, get, post},
     Router,
 };
 use std::sync::Arc;
@@ -41,6 +43,8 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = config::Config::from_env()?;
     std::fs::create_dir_all(cfg.vault_dir())?;
+    std::fs::create_dir_all(cfg.files_dir())?;
+    std::fs::create_dir_all(cfg.upload_tmp_dir())?;
     let secret = crypto::load_or_create_secret(&cfg.data_dir)?;
     let pool = db::init(&cfg.data_dir).await?;
     db::ensure_settings(&pool).await?;
@@ -55,13 +59,36 @@ async fn main() -> anyhow::Result<()> {
     if let Err(err) = routes::docs::reindex_all(&state).await {
         tracing::warn!(error = %err, "initial index failed; search may be incomplete");
     }
+    files::worker::spawn(state.clone());
 
+    let upload_limit = cfg.max_upload_bytes as usize + 1024 * 1024;
     let public = Router::new()
         .route("/healthz", get(routes::health::healthz))
         .route("/api/bootstrap", get(routes::bootstrap::bootstrap))
         .route("/api/setup/status", get(routes::setup::status))
         .route("/api/setup", post(routes::setup::complete_setup))
         .route("/api/auth/login", post(routes::auth::login))
+        .route("/api/public/shares/{token}", get(routes::public::share))
+        .route(
+            "/api/public/shares/{token}/nodes",
+            get(routes::public::nodes),
+        )
+        .route(
+            "/api/public/shares/{token}/files/{id}/download",
+            get(routes::public::download),
+        )
+        .route(
+            "/api/public/shares/{token}/files/{id}/content",
+            get(routes::public::content),
+        )
+        .route(
+            "/api/public/shares/{token}/files/{id}/thumbnail",
+            get(routes::public::thumbnail),
+        )
+        .route(
+            "/api/public/shares/{token}/download.zip",
+            get(routes::public::download_zip),
+        )
         .with_state(state.clone());
 
     let protected = Router::new()
@@ -78,6 +105,39 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/docs/rename", post(routes::docs::rename))
         .route("/api/docs/backlinks", get(routes::docs::backlinks))
         .route("/api/search", get(routes::docs::search))
+        .route("/api/files", get(routes::files::list))
+        .route("/api/files/folders", post(routes::files::create_folder))
+        .route(
+            "/api/files/upload",
+            post(routes::files::upload).layer(DefaultBodyLimit::max(upload_limit)),
+        )
+        .route("/api/files/recent", get(routes::files::recent))
+        .route("/api/files/search", get(routes::files::search))
+        .route("/api/files/stats", get(routes::files::stats))
+        .route(
+            "/api/files/{id}",
+            get(routes::files::get_file)
+                .patch(routes::files::update_node)
+                .delete(routes::files::delete_node),
+        )
+        .route("/api/files/{id}/content", get(routes::files::content))
+        .route("/api/files/{id}/download", get(routes::files::download))
+        .route("/api/files/{id}/thumbnail", get(routes::files::thumbnail))
+        .route("/api/files/{id}/vision", post(routes::files::retry_vision))
+        .route("/api/files/{id}/reindex", post(routes::files::retry_index))
+        .route(
+            "/api/shares",
+            get(routes::shares::list_shares).post(routes::shares::create_share),
+        )
+        .route(
+            "/api/shares/{id}",
+            axum::routing::patch(routes::shares::update_share).delete(routes::shares::revoke_share),
+        )
+        .route(
+            "/api/tokens",
+            get(routes::tokens::list).post(routes::tokens::create),
+        )
+        .route("/api/tokens/{id}", delete(routes::tokens::revoke))
         .route(
             "/api/settings/llm",
             get(routes::settings::get_llm).put(routes::settings::put_llm),
