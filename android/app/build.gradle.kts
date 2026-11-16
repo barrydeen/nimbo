@@ -117,7 +117,7 @@ dependencies {
 
     implementation("androidx.work:work-runtime-ktx:2.10.3")
 
-    val room = "2.8.2"
+    val room = "2.8.5"
     implementation("androidx.room:room-runtime:$room")
     implementation("androidx.room:room-ktx:$room")
     ksp("androidx.room:room-compiler:$room")
