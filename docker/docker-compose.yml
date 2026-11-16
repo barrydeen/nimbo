@@ -1,0 +1,19 @@
+services:
+  nimbo:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: nimbo:latest
+    container_name: nimbo
+    ports:
+      - "8080:8080"
+    volumes:
+      - nimbo_data:/data
+    environment:
+      # Set to "true" when serving behind HTTPS so the session cookie is Secure.
+      NIMBO_SECURE_COOKIES: "false"
+      # NIMBO_SESSION_TTL_DAYS: "30"
+    restart: unless-stopped
+
+volumes:
+  nimbo_data:
