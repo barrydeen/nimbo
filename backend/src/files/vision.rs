@@ -61,6 +61,13 @@ pub async fn process(state: &AppState, node: Node) -> Result<(), ApiError> {
         .await?;
         return Ok(());
     }
+    let target = match agent::indexing_target(&cfg) {
+        Ok(target) => target,
+        Err(err) => {
+            set_skipped(&state.pool, &node, &err.message).await?;
+            return Ok(());
+        }
+    };
 
     let blob = node.blob_path(state)?;
     let size = tokio::fs::metadata(&blob).await.map(|meta| meta.len())?;
@@ -75,7 +82,7 @@ pub async fn process(state: &AppState, node: Node) -> Result<(), ApiError> {
         .await
         .map_err(|err| ApiError::internal(format!("image task failed: {err}")))??;
 
-    let described = agent::describe_image(&cfg, &jpeg, &node.name).await?;
+    let described = agent::describe_image(&target, &jpeg, &node.name).await?;
     apply_description(&state.pool, &node, &described).await?;
     Ok(())
 }

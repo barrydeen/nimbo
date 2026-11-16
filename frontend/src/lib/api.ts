@@ -24,13 +24,25 @@ export type SearchResult = {
 	snippet: string;
 	score: number;
 };
+export type ProviderSettings = {
+	id: string;
+	name: string;
+	base_url: string;
+	api_key_set: boolean;
+	models: string[];
+};
+
+export type ModelRef = {
+	provider_id: string;
+	model: string;
+};
+
 export type LlmSettings = {
 	configured: boolean;
-	base_url: string;
-	model: string;
+	providers: ProviderSettings[];
+	document_model: ModelRef | null;
+	indexing_model: ModelRef | null;
 	temperature: number;
-	api_key_set: boolean;
-	vision_model: string | null;
 	describe_images: boolean;
 };
 
@@ -247,17 +259,31 @@ export const api = {
 		request<{ results: SearchResult[] }>(`/api/search?q=${encodeURIComponent(q)}`, { signal }),
 	getLlm: () => request<LlmSettings>('/api/settings/llm'),
 	saveLlm: (body: {
-		base_url: string;
-		model: string;
-		api_key?: string;
+		providers: {
+			id: string;
+			name?: string;
+			base_url: string;
+			models: string[];
+			api_key?: string;
+			clear_api_key?: boolean;
+			confirm_reuse_api_key?: boolean;
+		}[];
+		document_model?: ModelRef | null;
+		indexing_model?: ModelRef | null;
 		temperature?: number;
-		vision_model?: string;
 		describe_images?: boolean;
-		clear_api_key?: boolean;
-		confirm_reuse_api_key?: boolean;
 	}) =>
 		request<LlmSettings>('/api/settings/llm', {
 			method: 'PUT',
+			body: JSON.stringify(body)
+		}),
+	listLlmModels: (body: {
+		provider_id?: string;
+		base_url: string;
+		api_key?: string;
+	}) =>
+		request<{ models: string[] }>('/api/settings/llm/models', {
+			method: 'POST',
 			body: JSON.stringify(body)
 		}),
 	testLlm: () =>

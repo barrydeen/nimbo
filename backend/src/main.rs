@@ -213,6 +213,11 @@ async fn main() -> anyhow::Result<()> {
                 .layer(DefaultBodyLimit::max(SETTINGS_BODY_LIMIT)),
         )
         .route(
+            "/api/settings/llm/models",
+            post(routes::settings::list_llm_models)
+                .layer(DefaultBodyLimit::max(SETTINGS_BODY_LIMIT)),
+        )
+        .route(
             "/api/settings/llm/test",
             post(routes::settings::test_llm).layer(DefaultBodyLimit::max(SETTINGS_BODY_LIMIT)),
         )
