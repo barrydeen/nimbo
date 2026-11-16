@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onDestroy, onMount, tick } from 'svelte';
-	import { beforeNavigate, goto, replaceState } from '$app/navigation';
+	import { goto, replaceState } from '$app/navigation';
 	import {
 		api,
 		errorMessage,
@@ -10,6 +10,8 @@
 		type User
 	} from '$lib/api';
 	import Editor from '$lib/components/Editor.svelte';
+	import AgentPanel from '$lib/components/AgentPanel.svelte';
+	import { applyDraftEditsToText, type AgentDraft, type AgentDraftEdit } from '$lib/agent';
 	import { RequestScope, isAbortError } from '$lib/generations';
 	import { normalizeWikiTarget, renderMarkdown } from '$lib/markdown';
 	import { sanitizeSnippet } from '$lib/sanitize';
@@ -24,10 +26,12 @@
 	let dirty = false;
 	let saving = false;
 	let saveQueued = false;
+	let autosaveTimer: ReturnType<typeof setTimeout> | null = null;
 	let split = true;
 	let aiEnabled = false;
 	let editorKey = 0;
 	let contentVersion = 0;
+	let assistantOpen = false;
 
 	let backlinks: { path: string; title: string }[] = [];
 	let outlinks: { target: string; path: string | null; exists: boolean }[] = [];
@@ -42,6 +46,7 @@
 
 	let errorMsg = '';
 	let statusMsg = '';
+	let statusKey = 0;
 	let statusTimer: ReturnType<typeof setTimeout> | null = null;
 	let initError = '';
 	let initBusy = false;
@@ -51,50 +56,31 @@
 	let previewHtml = '';
 	let previewTimer: ReturnType<typeof setTimeout> | null = null;
 
-	let railTab: 'links' | 'chat' = 'links';
-	let agentMessages: {
-		id: number;
-		role: 'user' | 'assistant';
-		content: string;
-	}[] = [];
-	let agentInput = '';
-	let agentBusy = false;
-	let agentError = '';
-	let msgSeq = 0;
 	let searchTimer: ReturnType<typeof setTimeout> | null = null;
+	let editorRef: Editor;
+	let selection: { text: string; from: number; to: number } | null = null;
 
 	const docScope = new RequestScope();
 	const linkScope = new RequestScope();
 	const searchScope = new RequestScope();
-	const MAX_AGENT_MESSAGES = 40;
-
-	let agentAbort: AbortController | null = null;
-	let agentRun = 0;
-	let agentFlushHandle: number | null = null;
-	let agentPending = '';
-	let agentAssistantId = 0;
+	const AUTOSAVE_DELAY = 3000;
 
 	onMount(() => {
 		void init();
 		return () => {
 			disposed = true;
-			abortAgent();
 			docScope.invalidate();
 			linkScope.invalidate();
 			searchScope.invalidate();
 			if (previewTimer) clearTimeout(previewTimer);
 			if (searchTimer) clearTimeout(searchTimer);
 			if (statusTimer) clearTimeout(statusTimer);
+			if (autosaveTimer) clearTimeout(autosaveTimer);
 		};
 	});
 
 	onDestroy(() => {
 		disposed = true;
-		abortAgent();
-	});
-
-	beforeNavigate(() => {
-		abortAgent();
 	});
 
 	function message(err: unknown): string {
@@ -103,8 +89,24 @@
 
 	function flash(text: string) {
 		statusMsg = text;
+		statusKey += 1;
 		if (statusTimer) clearTimeout(statusTimer);
 		statusTimer = setTimeout(() => (statusMsg = ''), 1600);
+	}
+
+	function clearAutosave() {
+		if (autosaveTimer) {
+			clearTimeout(autosaveTimer);
+			autosaveTimer = null;
+		}
+	}
+
+	function scheduleAutosave() {
+		if (autosaveTimer) return;
+		autosaveTimer = setTimeout(() => {
+			autosaveTimer = null;
+			if (dirty) void save();
+		}, AUTOSAVE_DELAY);
 	}
 
 	async function init() {
@@ -228,6 +230,7 @@
 
 	async function openDoc(path: string, options: { force?: boolean } = {}) {
 		if (dirty && !options.force && !confirm('Discard unsaved changes?')) return;
+		clearAutosave();
 		const op = docScope.begin();
 		const versionAtStart = contentVersion;
 		errorMsg = '';
@@ -239,7 +242,9 @@
 					'The document changed while it was loading, so it was not replaced. Save or discard your edits first.';
 				return;
 			}
+			clearAutosave();
 			selected = path;
+			selection = null;
 			content = doc.content;
 			hash = doc.hash;
 			dirty = false;
@@ -263,11 +268,12 @@
 		}
 	}
 
-	async function save() {
-		if (!selected || !dirty) return;
+	async function save(): Promise<boolean> {
+		clearAutosave();
+		if (!selected || !dirty) return true;
 		if (saving) {
 			saveQueued = true;
-			return;
+			return false;
 		}
 		const path = selected;
 		const submitted = content;
@@ -275,29 +281,31 @@
 		const version = contentVersion;
 		saving = true;
 		errorMsg = '';
+		let ok = true;
 		try {
 			const res = await api.saveDoc({ path, content: submitted, base_hash: baseHash });
 			if (selected === path) {
 				hash = res.hash;
 				// Only clear dirty when the editor still holds exactly what was sent.
 				dirty = content !== submitted || contentVersion !== version;
+				if (!dirty) flash('Saved');
 			}
-			flash('Saved');
 			try {
 				await refresh();
 			} catch (err) {
 				if (isUnauthorized(err)) {
 					await goto('/login');
-					return;
+					ok = false;
 				}
 			}
 			if (selected === path) await loadLinks(path, docScope.current);
 		} catch (err) {
+			ok = false;
 			if (isUnauthorized(err)) {
 				await goto('/login');
-				return;
+			} else if (selected === path) {
+				errorMsg = message(err);
 			}
-			if (selected === path) errorMsg = message(err);
 		} finally {
 			saving = false;
 			if (saveQueued) {
@@ -305,12 +313,14 @@
 				if (selected === path && dirty) void save();
 			}
 		}
+		return ok;
 	}
 
 	async function createDoc() {
 		const raw = newPath.trim();
 		if (!raw) return;
 		if (dirty && !confirm('Discard unsaved changes?')) return;
+		clearAutosave();
 		const path = raw.endsWith('.md') ? raw : `${raw}.md`;
 		const title = path.split('/').pop()?.replace(/\.md$/, '') ?? 'Untitled';
 		try {
@@ -365,6 +375,7 @@
 		const path = selected;
 		const warning = dirty ? ' Unsaved edits will be discarded.' : '';
 		if (!confirm(`Delete ${path}? This removes the file from disk.${warning}`)) return;
+		clearAutosave();
 
 		// Invalidate any older open/save continuation for this document.
 		const op = docScope.begin();
@@ -448,6 +459,13 @@
 		}
 	}
 
+	function openFromAssistant(path: string) {
+		if (typeof window !== 'undefined' && window.innerWidth <= 1100) {
+			assistantOpen = false;
+		}
+		void openDoc(path);
+	}
+
 	function onPreviewClick(event: MouseEvent) {
 		const anchor = (event.target as HTMLElement).closest('a[data-wiki]') as HTMLAnchorElement | null;
 		if (!anchor) return;
@@ -463,7 +481,6 @@
 		if (loggingOut) return;
 		loggingOut = true;
 		errorMsg = '';
-		abortAgent();
 		try {
 			await api.logout();
 			await goto('/login');
@@ -474,133 +491,116 @@
 		}
 	}
 
-	function trimAgentHistory(messages: typeof agentMessages): typeof agentMessages {
-		if (messages.length <= MAX_AGENT_MESSAGES) return messages;
-		return messages.slice(messages.length - MAX_AGENT_MESSAGES);
-	}
-
-	function flushAgent() {
-		if (agentFlushHandle !== null) {
-			cancelAnimationFrame(agentFlushHandle);
-			agentFlushHandle = null;
+	async function applyDraft(
+		draft: AgentDraft,
+		edits: AgentDraftEdit[]
+	): Promise<{ ok: boolean; error?: string; warning?: string }> {
+		if (draft.kind === 'create') {
+			if (docs.some((doc) => doc.path === draft.path)) {
+				return { ok: false, error: `A document already exists at ${draft.path}.` };
+			}
+			if (dirty) {
+				const saved = await save();
+				if (!saved || dirty) {
+					return {
+						ok: false,
+						error: 'Save the current note before creating a new document.'
+					};
+				}
+			}
+			try {
+				await api.saveDoc({
+					path: draft.path,
+					content: draft.content ?? '',
+					base_hash: null
+				});
+				await refresh();
+				flash('Created');
+				return { ok: true };
+			} catch (err) {
+				if (isUnauthorized(err)) {
+					await goto('/login');
+					return { ok: false, error: 'Your session expired.' };
+				}
+				return { ok: false, error: message(err) };
+			}
 		}
-		if (!agentPending) return;
-		const append = agentPending;
-		agentPending = '';
-		agentMessages = trimAgentHistory(
-			agentMessages.map((entry) =>
-				entry.id === agentAssistantId
-					? { ...entry, content: entry.content + append }
-					: entry
-			)
-		);
-	}
 
-	function scheduleAgentFlush() {
-		if (agentFlushHandle !== null) return;
-		agentFlushHandle = requestAnimationFrame(() => {
-			agentFlushHandle = null;
-			flushAgent();
-		});
-	}
-
-	function abortAgent() {
-		agentRun += 1;
-		agentAbort?.abort();
-		agentAbort = null;
-		flushAgent();
-		agentPending = '';
-		if (agentFlushHandle !== null) {
-			cancelAnimationFrame(agentFlushHandle);
-			agentFlushHandle = null;
+		if (draft.path === selected) {
+			if (!editorRef) return { ok: false, error: 'The editor is not ready.' };
+			let result: { ok: boolean; error?: string; ranges?: { from: number; to: number }[] };
+			if (draft.kind === 'edit') {
+				result = editorRef.applyDraftEdits(edits);
+			} else if (draft.kind === 'append') {
+				result = editorRef.appendContent(draft.content ?? '');
+			} else if (draft.kind === 'replace') {
+				result = editorRef.replaceContent(draft.content ?? '');
+			} else {
+				return { ok: false, error: 'Unknown draft kind.' };
+			}
+			if (!result.ok) return { ok: false, error: result.error };
+			await tick();
+			const saved = await save();
+			if (!saved) {
+				return {
+					ok: true,
+					warning:
+						'Applied in the editor, but saving failed. Your changes are still in the buffer.'
+				};
+			}
+			if (dirty) {
+				return {
+					ok: true,
+					warning: 'Applied and saved, but newer edits are still unsaved.'
+				};
+			}
+			if (result.ranges?.[0]) {
+				editorRef.revealRange(result.ranges[0].from, result.ranges[0].to);
+			}
+			flash('Applied');
+			return { ok: true };
 		}
-		agentBusy = false;
-	}
-
-	function stopAgent() {
-		if (!agentBusy) return;
-		abortAgent();
-		agentError = 'Stopped.';
-	}
-
-	async function sendAgent() {
-		const userMessage = agentInput.trim();
-		if (!userMessage || agentBusy) return;
-		agentInput = '';
-		agentError = '';
-		const run = ++agentRun;
-		const abort = new AbortController();
-		agentAbort = abort;
-		agentBusy = true;
-		const assistantId = ++msgSeq;
-		agentAssistantId = assistantId;
-		agentMessages = trimAgentHistory([
-			...agentMessages,
-			{ id: ++msgSeq, role: 'user', content: userMessage },
-			{ id: assistantId, role: 'assistant', content: '' }
-		]);
 
 		try {
-			const res = await fetch('/api/agent/chat', {
-				method: 'POST',
-				credentials: 'include',
-				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ message: userMessage, path: selected }),
-				signal: abort.signal
-			});
-			if (res.status === 401) {
-				await goto('/login');
-				return;
+			const doc = await api.getDoc(draft.path);
+			let next = doc.content;
+			if (draft.kind === 'edit') {
+				const applied = applyDraftEditsToText(doc.content, edits);
+				if (!applied.ok) return { ok: false, error: applied.error };
+				next = applied.content;
+			} else if (draft.kind === 'append') {
+				next = doc.content + (draft.content ?? '');
+			} else if (draft.kind === 'replace') {
+				next = draft.content ?? '';
+			} else {
+				return { ok: false, error: 'Unknown draft kind.' };
 			}
-			if (!res.ok) {
-				const data = await res.json().catch(() => ({}));
-				throw new Error(data.error || `${res.status} ${res.statusText}`);
-			}
-			const reader = res.body?.getReader();
-			if (!reader) throw new Error('streaming is not supported in this browser');
-
-			const decoder = new TextDecoder();
-			let buffer = '';
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
-				if (run !== agentRun || abort.signal.aborted) {
-					await reader.cancel().catch(() => undefined);
-					break;
-				}
-				buffer += decoder.decode(value, { stream: true });
-				buffer = buffer.replace(/\r\n/g, '\n');
-				let cut: number;
-				while ((cut = buffer.indexOf('\n\n')) !== -1) {
-					const frame = buffer.slice(0, cut);
-					buffer = buffer.slice(cut + 2);
-					let event = 'message';
-					const dataLines: string[] = [];
-					for (const line of frame.split('\n')) {
-						if (line.startsWith('event:')) event = line.slice(6).trim();
-						else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
-					}
-					const data = dataLines.join('\n');
-					if (event === 'error') {
-						agentError = data;
-					} else if (event === 'done') {
-						flushAgent();
-					} else if (data) {
-						agentPending += data;
-						scheduleAgentFlush();
-					}
-				}
-			}
-			flushAgent();
+			await api.saveDoc({ path: draft.path, content: next, base_hash: doc.hash });
+			await refresh();
+			flash('Saved');
+			return { ok: true };
 		} catch (err) {
-			if (!abort.signal.aborted && run === agentRun) agentError = message(err);
-		} finally {
-			if (run === agentRun) {
-				flushAgent();
-				agentBusy = false;
-				if (agentAbort === abort) agentAbort = null;
+			if (isUnauthorized(err)) {
+				await goto('/login');
+				return { ok: false, error: 'Your session expired.' };
 			}
+			return { ok: false, error: message(err) };
 		}
+	}
+
+	async function undoDraft(draft: AgentDraft): Promise<{ ok: boolean; error?: string }> {
+		if (draft.path !== selected || !editorRef) {
+			return { ok: false, error: 'Open the document to undo this change.' };
+		}
+		if (!editorRef.undo()) {
+			return { ok: false, error: 'There is nothing to undo in the editor.' };
+		}
+		await tick();
+		const saved = await save();
+		if (!saved || dirty) {
+			return { ok: false, error: 'Undone in the editor, but saving failed.' };
+		}
+		return { ok: true };
 	}
 
 	async function toggleSplit() {
@@ -628,6 +628,13 @@
 				<span>{user.username}</span>
 			</div>
 		{/if}
+		<button
+			class="btn ghost assistant-toggle"
+			on:click={() => (assistantOpen = true)}
+			title="Open the assistant"
+		>
+			Assistant
+		</button>
 		<button class="btn ghost" on:click={() => goto('/drive')} disabled={loggingOut}>Files</button>
 		{#if user?.role === 'admin'}
 			<button class="btn ghost" on:click={() => goto('/settings')} disabled={loggingOut}>Settings</button>
@@ -732,13 +739,16 @@
 			<div class="toolbar">
 				<span class="path">{selected}</span>
 				{#if dirty}<span class="dot dirty" title="Unsaved changes"></span>{/if}
-				{#if statusMsg}<span class="path" style="color: var(--good)">{statusMsg}</span>{/if}
+				{#if statusMsg}
+					{#key statusKey}
+						<span class="save-flash" aria-live="polite">
+							<span class="save-check">✓</span>{statusMsg}
+						</span>
+					{/key}
+				{/if}
 				<div class="spacer"></div>
 				<button class="btn" class:active={split} on:click={toggleSplit}>
 					{split ? 'Single pane' : 'Split preview'}
-				</button>
-				<button class="btn primary" on:click={save} disabled={!dirty || saving}>
-					{saving ? 'Saving…' : 'Save'}
 				</button>
 				<button class="btn ghost" on:click={renameDoc} disabled={saving}>Rename</button>
 				<button class="btn danger" on:click={deleteDoc}>Delete</button>
@@ -748,6 +758,7 @@
 				<div class="editor-pane">
 					{#key `${selected}:${editorKey}`}
 						<Editor
+							bind:this={editorRef}
 							bind:aiEnabled
 							value={content}
 							docPaths={docs.map((d) => d.path)}
@@ -756,9 +767,11 @@
 								dirty = true;
 								contentVersion += 1;
 								schedulePreview();
+								scheduleAutosave();
 							}}
 							onsave={save}
 							onunauthorized={() => goto('/login')}
+							onselection={(next) => (selection = next)}
 						/>
 					{/key}
 				</div>
@@ -787,84 +800,38 @@
 						Create your first document
 					</button>
 					<p style="margin-top: 18px;">
-						<span class="kbd">Ctrl</span> + <span class="kbd">S</span> saves while editing.
+						Changes save automatically. <span class="kbd">Ctrl</span> +
+						<span class="kbd">S</span> saves immediately.
 					</p>
 				</div>
 			</div>
 		{/if}
 	</main>
 
-	<aside class="rail">
-		<div class="rail-tabs">
-			<button class="tab" class:active={railTab === 'links'} on:click={() => (railTab = 'links')}>
-				Links
-			</button>
-			<button class="tab" class:active={railTab === 'chat'} on:click={() => (railTab = 'chat')}>
-				Chat
-			</button>
-		</div>
-
-		{#if railTab === 'links'}
-			{#if selected}
-				<h3>Outgoing links</h3>
-				{#each outlinks as link (link.target)}
-					{#if link.exists && link.path}
-						<button class="link-item" on:click={() => openDoc(link.path!)}>
-							{link.target}
-						</button>
-					{:else}
-						<button class="link-item missing" disabled>{link.target} · missing</button>
-					{/if}
-				{:else}
-					<span class="empty">No links yet. Type <code>[[</code> to link a document.</span>
-				{/each}
-
-				<h3>Backlinks</h3>
-				{#each backlinks as link (link.path)}
-					<button class="link-item" on:click={() => openDoc(link.path)}>
-						{link.title || link.path}
-					</button>
-				{:else}
-					<span class="empty">No documents link here yet.</span>
-				{/each}
-			{:else}
-				<h3>Vault</h3>
-				<span class="empty">{docs.length} document{docs.length === 1 ? '' : 's'} indexed.</span>
-			{/if}
-		{:else}
-			<h3>Chat</h3>
-			<div class="agent-log">
-				{#each agentMessages as msg (msg.id)}
-					<div class="msg" class:user={msg.role === 'user'}>
-						<div class="msg-text">{msg.content}</div>
-					</div>
-				{:else}
-					<span class="empty">Ask about your vault.</span>
-				{/each}
-				{#if agentError}
-					<div class="banner" style="margin: 8px 0 0;">{agentError}</div>
-				{/if}
-			</div>
-			<div class="agent-input">
-				<textarea
-					rows="2"
-					placeholder="Ask the vault…"
-					bind:value={agentInput}
-					on:keydown={(e) => {
-						if (e.key === 'Enter' && !e.shiftKey) {
-							e.preventDefault();
-							sendAgent();
-						}
-					}}
-				></textarea>
-				{#if agentBusy}
-					<button class="btn" on:click={stopAgent}>Stop</button>
-				{:else}
-					<button class="btn primary" on:click={sendAgent} disabled={!agentInput.trim()}>
-						Send
-					</button>
-				{/if}
-			</div>
-		{/if}
-	</aside>
+	{#if assistantOpen}
+		<button
+			class="agent-backdrop"
+			aria-label="Close assistant"
+			on:click={() => (assistantOpen = false)}
+		></button>
+	{/if}
+	<AgentPanel
+		path={selected}
+		docContent={content}
+		docHash={hash}
+		docVersion={contentVersion}
+		{dirty}
+		{selection}
+		{docs}
+		{user}
+		{backlinks}
+		{outlinks}
+		open={assistantOpen}
+		onclose={() => (assistantOpen = false)}
+		onapplydraft={applyDraft}
+		onundo={undoDraft}
+		onopendoc={openFromAssistant}
+		onnotify={flash}
+		onconfigure={() => goto('/settings')}
+	/>
 </div>

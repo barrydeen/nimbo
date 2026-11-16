@@ -4,10 +4,11 @@
 	import { EditorState, StateEffect, StateField } from '@codemirror/state';
 	import { basicSetup } from 'codemirror';
 	import { markdown } from '@codemirror/lang-markdown';
-	import { indentWithTab } from '@codemirror/commands';
+	import { indentWithTab, undo as undoCommand } from '@codemirror/commands';
 	import { autocompletion, completionStatus, type CompletionContext } from '@codemirror/autocomplete';
 	import { oneDark } from '@codemirror/theme-one-dark';
 	import { api, errorMessage, isUnauthorized } from '$lib/api';
+	import { applyDraftEditsToText, type AgentDraftEdit } from '$lib/agent';
 	import {
 		isRangeAction,
 		isRangeResultStale,
@@ -20,6 +21,8 @@
 	export let onchange: (next: string) => void = () => {};
 	export let onsave: () => void = () => {};
 	export let onunauthorized: () => void = () => {};
+	export let onselection: (selection: { text: string; from: number; to: number } | null) => void =
+		() => {};
 
 	type Ghost = { from: number; text: string } | null;
 	type AgentResult = {
@@ -73,8 +76,34 @@
 		]);
 	});
 
+	type HighlightRange = { from: number; to: number };
+	const setHighlight = StateEffect.define<HighlightRange[]>();
+
+	const highlightField = StateField.define<HighlightRange[]>({
+		create: () => [],
+		update(value, tr) {
+			for (const effect of tr.effects) {
+				if (effect.is(setHighlight)) return effect.value;
+			}
+			if (tr.docChanged) return [];
+			return value;
+		}
+	});
+
+	const highlightDecorations = EditorView.decorations.compute([highlightField], (state) => {
+		const ranges = state.field(highlightField);
+		if (!ranges.length) return Decoration.none;
+		return Decoration.set(
+			ranges.map((range) =>
+				Decoration.mark({ class: 'cm-agent-highlight' }).range(range.from, range.to)
+			)
+		);
+	});
+
 	let host: HTMLDivElement;
 	let view: EditorView | null = null;
+	let highlightTimer: ReturnType<typeof setTimeout> | null = null;
+	let selectionTimer: ReturnType<typeof setTimeout> | null = null;
 
 	let suggestTimer: ReturnType<typeof setTimeout> | null = null;
 	let suggestBusy = false;
@@ -241,6 +270,109 @@
 		if (!target.state.field(ghostField)) return false;
 		target.dispatch({ effects: setGhost.of(null) });
 		return true;
+	}
+
+	function highlightRanges(ranges: HighlightRange[]) {
+		const current = view;
+		if (!current) return;
+		if (highlightTimer) clearTimeout(highlightTimer);
+		current.dispatch({ effects: setHighlight.of(ranges) });
+		highlightTimer = setTimeout(() => {
+			highlightTimer = null;
+			if (view) view.dispatch({ effects: setHighlight.of([]) });
+		}, 2400);
+	}
+
+	export function applyDraftEdits(
+		edits: AgentDraftEdit[]
+	): { ok: boolean; error?: string; ranges?: HighlightRange[] } {
+		const current = view;
+		if (!current) return { ok: false, error: 'The editor is not ready.' };
+		const result = applyDraftEditsToText(current.state.doc.toString(), edits);
+		if (!result.ok) return result;
+		current.dispatch({
+			changes: result.changes,
+			userEvent: 'input.agent',
+			scrollIntoView: true
+		});
+		highlightRanges(result.ranges);
+		current.focus();
+		return { ok: true, ranges: result.ranges };
+	}
+
+	export function replaceContent(
+		next: string
+	): { ok: boolean; error?: string; ranges?: HighlightRange[] } {
+		const current = view;
+		if (!current) return { ok: false, error: 'The editor is not ready.' };
+		const length = current.state.doc.length;
+		current.dispatch({
+			changes: { from: 0, to: length, insert: next },
+			userEvent: 'input.agent',
+			scrollIntoView: true
+		});
+		const range = { from: 0, to: next.length };
+		highlightRanges([range]);
+		current.focus();
+		return { ok: true, ranges: [range] };
+	}
+
+	export function appendContent(
+		text: string
+	): { ok: boolean; error?: string; ranges?: HighlightRange[] } {
+		const current = view;
+		if (!current) return { ok: false, error: 'The editor is not ready.' };
+		const length = current.state.doc.length;
+		current.dispatch({
+			changes: { from: length, insert: text },
+			userEvent: 'input.agent',
+			scrollIntoView: true
+		});
+		const range = { from: length, to: length + text.length };
+		highlightRanges([range]);
+		current.focus();
+		return { ok: true, ranges: [range] };
+	}
+
+	export function revealRange(from: number, to: number) {
+		const current = view;
+		if (!current) return;
+		const length = current.state.doc.length;
+		const start = Math.max(0, Math.min(from, length));
+		const end = Math.max(start, Math.min(to, length));
+		current.dispatch({
+			selection: { anchor: start, head: end },
+			scrollIntoView: true
+		});
+		highlightRanges([{ from: start, to: end }]);
+		current.focus();
+	}
+
+	export function undo() {
+		const current = view;
+		if (!current) return false;
+		const applied = undoCommand(current);
+		current.focus();
+		return applied;
+	}
+
+	function reportSelection() {
+		const current = view;
+		if (!current) return;
+		const { from, to } = current.state.selection.main;
+		if (from === to) {
+			onselection(null);
+			return;
+		}
+		onselection({ from, to, text: current.state.sliceDoc(from, to) });
+	}
+
+	function scheduleSelectionReport() {
+		if (selectionTimer) clearTimeout(selectionTimer);
+		selectionTimer = setTimeout(() => {
+			selectionTimer = null;
+			reportSelection();
+		}, 120);
 	}
 
 	function wrapSelection(before: string, after: string, placeholder: string) {
@@ -464,6 +596,8 @@
 					EditorView.lineWrapping,
 					ghostField,
 					ghostDecorations,
+					highlightField,
+					highlightDecorations,
 					autocompletion({ override: [wikiSource] }),
 					keymap.of([
 						{ key: 'Tab', run: acceptGhost },
@@ -506,6 +640,7 @@
 						}
 						if (update.docChanged || update.selectionSet) {
 							scheduleSuggest();
+							scheduleSelectionReport();
 						}
 					}),
 					EditorView.theme({
@@ -542,6 +677,8 @@
 		return () => {
 			clearSuggestTimer();
 			cancelSuggestion();
+			if (highlightTimer) clearTimeout(highlightTimer);
+			if (selectionTimer) clearTimeout(selectionTimer);
 			agentAbort?.abort();
 			agentAbort = null;
 			view = null;

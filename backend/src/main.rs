@@ -25,8 +25,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const AUTH_BODY_LIMIT: usize = 8 * 1024;
 const DOC_BODY_LIMIT: usize = 16 * 1024 * 1024;
-const AGENT_BODY_LIMIT: usize = 1024 * 1024;
-const SETTINGS_BODY_LIMIT: usize = 64 * 1024;
+const AGENT_BODY_LIMIT: usize = DOC_BODY_LIMIT;
+const SETTINGS_BODY_LIMIT: usize = 1024 * 1024;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 const RETENTION_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 

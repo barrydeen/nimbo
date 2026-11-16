@@ -893,6 +893,17 @@ pub fn read_document(state: &AppState, raw_path: &str) -> Result<String, ApiErro
     String::from_utf8(bytes).map_err(|_| ApiError::internal("document is not valid UTF-8"))
 }
 
+/// Reports whether a vault document exists without exposing its contents.
+/// Used by agent draft tools to reject a create that would collide.
+pub fn document_exists(state: &AppState, raw_path: &str) -> Result<bool, ApiError> {
+    let rel = normalize_path(raw_path)?;
+    match resolve_read_path(&state.cfg.vault_dir(), &rel) {
+        Ok(_) => Ok(true),
+        Err(err) if err.status == axum::http::StatusCode::NOT_FOUND => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 pub async fn get_content(
     State(state): State<Arc<AppState>>,
     Query(params): Query<PathQuery>,

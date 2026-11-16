@@ -1,13 +1,13 @@
 use crate::{agent, auth::AuthUser, error::ApiError, routes::docs, state::AppState};
 use axum::{
     extract::{Extension, State},
-    response::sse::{Event, Sse},
+    response::sse::{Event, KeepAlive, Sse},
     Json,
 };
 use futures_util::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{convert::Infallible, sync::Arc};
+use std::{convert::Infallible, sync::Arc, time::Duration};
 
 const MAX_ACTION_CHARS: usize = 8_000;
 const MAX_TAIL_CHARS: usize = 4_000;
@@ -20,38 +20,18 @@ pub async fn chat(
     Extension(_user): Extension<AuthUser>,
     Json(req): Json<agent::ChatRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    if req.message.trim().is_empty() {
-        return Err(ApiError::bad_request("message is required"));
-    }
-    if req.message.chars().count() > agent::MAX_CHAT_MESSAGE_CHARS
-        || req.message.len() > agent::MAX_CHAT_MESSAGE_BYTES
-    {
-        return Err(ApiError::bad_request(format!(
-            "message must be at most {} characters / {} bytes",
-            agent::MAX_CHAT_MESSAGE_CHARS,
-            agent::MAX_CHAT_MESSAGE_BYTES
-        )));
-    }
-    validate_path(req.path.as_deref())?;
+    agent::validate_chat_request(&req)?;
 
     let cfg = agent::load_config(&state)
         .await?
         .ok_or_else(|| ApiError::bad_request("no LLM provider configured"))?;
 
-    let context = agent::gather_context(&state, &req.message, req.path.as_deref()).await?;
-    let mut messages = vec![json!({
-        "role": "system",
-        "content": agent::system_prompt(),
-    })];
-    if !context.is_empty() {
-        messages.push(json!({
-            "role": "system",
-            "content": format!("Vault context:\n\n{context}"),
-        }));
-    }
-    messages.push(json!({ "role": "user", "content": req.message }));
-
-    Ok(Sse::new(agent::chat_stream(cfg, messages)))
+    let stream = agent::agent_stream(state, cfg, req);
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -110,6 +90,7 @@ pub async fn action(
     let cfg = agent::load_config(&state)
         .await?
         .ok_or_else(|| ApiError::bad_request("no LLM provider configured"))?;
+    let target = agent::document_target(&cfg)?;
 
     let text = match req.text {
         Some(text) if !text.trim().is_empty() => text,
@@ -203,7 +184,7 @@ pub async fn action(
     } else {
         agent::MAX_ACTION_OUTPUT_TOKENS
     };
-    let result = agent::complete(&cfg, system, &user, max_tokens).await?;
+    let result = agent::complete(&target, cfg.temperature, system, &user, max_tokens).await?;
     Ok(Json(json!({
         "action": action,
         "text": result,

@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
-    "check:sanitizer": "node scripts/check-sanitizer.mjs"
+    "check:sanitizer": "node scripts/check-sanitizer.mjs",
+    "check:agent": "node scripts/check-agent.mjs"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.8",
